@@ -27,12 +27,16 @@ module sram_masked #(parameter BITS=32, parameter DEPTH=1024)
 
 wire[BITS - 1:0] masked_input;
 wire[BITS - 1:0] sram0_output;
-assign masked_input = data_in & mask;
+wire masked_rd_en;
+assign masked_rd_en = rd_en | wr_en; // If writing, we need the stored data for masking
+									 // If not reading or writing, keep this
+									 // low
+assign masked_input = data_in & mask | (sram0_output & ~(mask));
 assign data_out = sram0_output & mask;
 
 sram sram0
 (
-	.clk(clk), .wr_en(wr_en), .rd_en(rd_en),
+	.clk(clk), .wr_en(wr_en), .rd_en(masked_rd_en),
 	.address(address), .data_in(masked_input),
 	.data_out(sram0_output)
 );
@@ -72,8 +76,9 @@ localparam STATE_LOAD_MEMORY = 8'd1;
 localparam STATE_TRANSMIT_MEMORY_DEBUG = 8'd3;
 localparam STATE_RUN_PROGRAM = 8'd2;
 localparam STATE_MEMLOADER_START = 8'd1;
-localparam STATE_MEMLOADER_WAIT = 8'd2;
-localparam STATE_MEMLOADER_WRITE = 8'd3;
+localparam STATE_MEMLOADER_LATCH = 8'd2;
+localparam STATE_MEMLOADER_WAIT = 8'd3;
+localparam STATE_MEMLOADER_WRITE = 8'd4;
 
 reg sram0_wr_en;
 reg sram0_rd_en;
@@ -107,10 +112,10 @@ always @* begin
 		endcase
 		sram0_addr_bus = sram_wr_ptr;
 		sram0_data_in = {4{read_data}}; // Since we use a mask, replicate the read byte
-		sram0_wr_en = 1;
+		sram0_wr_en = uart_rd_avl & ~(uart_start_read); // Latch data in when output is valid
 	end
 	else if (state == STATE_RUN_PROGRAM) begin
-		sram0_rd_en = (core0_wstrb == 0) && core0_mem_valid;
+		sram0_rd_en = (core0_wstrb == WSTRB_READ) && core0_mem_valid;
 		case(core0_wstrb)
 			WSTRB_BYTE0:
 				sram0_data_mask = 32'h000000ff;
@@ -129,7 +134,7 @@ always @* begin
 			default:
 				sram0_data_mask = 32'hffffffff;
 		endcase
-		sram0_addr_bus = core0_addr_bus;
+		sram0_addr_bus = core0_addr_bus[11:2]; // Ignore the first two bits because SRAM has a 1024*4K struct
 		sram0_data_in = core0_wdata_bus;
 		sram0_wr_en = (core0_wstrb != 0) && core0_mem_valid;
 	end
@@ -192,7 +197,7 @@ always @(posedge clk) begin
 							end else begin
 								mem_loader_state <= STATE_IDLE;
 							end
-						if(!uart_rx_busy) begin
+						end else if(!uart_rx_busy) begin
 							uart_start_read <= 1;
 						end else begin
 							uart_start_read <= 0;
@@ -201,12 +206,14 @@ always @(posedge clk) begin
 					STATE_MEMLOADER_START: begin // Wait till busy goes away. Then assert a read start
 						if(!uart_rx_busy) begin
 							uart_start_read <= 1;
-							mem_loader_state <= STATE_MEMLOADER_WAIT;
+							mem_loader_state <= STATE_MEMLOADER_LATCH;
 						end else
 							uart_start_read <= 0;
 					end
+					STATE_MEMLOADER_LATCH:
+						mem_loader_state <= STATE_MEMLOADER_WAIT;
 					STATE_MEMLOADER_WAIT: begin
-					uart_start_read <= 0;
+						uart_start_read <= 0;
 						if(uart_rd_avl) begin // New data is available
 							if(mem_loader_counter == 3) begin
 								sram_wr_ptr <= sram_wr_ptr + 1;
@@ -219,6 +226,7 @@ always @(posedge clk) begin
 								state <= STATE_TRANSMIT_MEMORY_DEBUG;
 								mem_loader_state <= STATE_IDLE;
 							end
+						end else begin
 						end
 					end
 					default: begin

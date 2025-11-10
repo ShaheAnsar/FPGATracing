@@ -34,13 +34,14 @@ struct UART_Tx{ // Simulated UART Tx
 		try{
 			std::size_t filesize = std::filesystem::file_size(filepath);
 			data_size = filesize;
-			data = std::make_unique<uint8_t[]>(filesize);
+			data = std::make_unique<uint8_t[]>(filesize + 1);
 			std::cout << "File size: " << filesize << std::endl;
 			std::fstream bin_file(filepath, std::ios::in | std::ios::binary);
 			std::cout << "File opned" << std::endl;
-			bin_file.read(reinterpret_cast<char*>(data.get()), data_size);
+			bin_file.read(reinterpret_cast<char*>(data.get()) + 1, data_size);
 			std::cout << "File read" << std::endl;
 			bin_file.close();
+			data[0] = (uint8_t)'S';
 		} catch(std::exception e) {
 			std::cerr << "Uh oh" << std::endl;
 		}
@@ -143,7 +144,11 @@ void sim_run_prog() { // Run program on core
 
 void dump_ram() {
 	for(int i = 0; i < 1024; i++) {
-		std::cout << std::hex << "[" << i*4 << "]: " << "0x" <<
+		std::cout << std::hex << "[" << i*4 << "]: ";
+		for(int j = 0; j < 4; j++)
+			std::cout << unsigned(reinterpret_cast<uint8_t*>
+				(&dut->rootp->picorv_learn__DOT__sram0__DOT__sram0__DOT__memory[i])[j]) << " ";
+		std::cout << ";\t" <<
 			dut->rootp->picorv_learn__DOT__sram0__DOT__sram0__DOT__memory[i] << std::endl;
 	}
 }

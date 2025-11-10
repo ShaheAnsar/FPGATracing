@@ -1,5 +1,3 @@
-
-
 module uart_tx#(parameter CLOCK=12000000, parameter BAUDRATE=9600)(output tx_pin,
 						input clk, input[32:0] baud_ctr_top, input n_reset,
 						input start_write, output reg write_avl, input [7:0] write_data);
