@@ -64,7 +64,7 @@ end
 endmodule
 
 module uart_rx#(parameter CLOCK=12000000, parameter BAUDRATE=9600)
-(input rx_pin, input clk, input start_read, output reg read_avl, output reg busy, input n_reset, output[7:0] read_data, output[1:0] dbg_leds);
+(input rx_pin, input clk, input start_read, output reg read_avl, output reg busy, input n_reset, output reg[7:0] read_data, output[1:0] dbg_leds);
 localparam baudgen_top = CLOCK/BAUDRATE - 1;
 localparam oversample_top = CLOCK/BAUDRATE/8 - 1;
 reg[32:0] baudgen_ctr;

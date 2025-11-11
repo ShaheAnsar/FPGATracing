@@ -147,9 +147,9 @@ void dump_ram() {
 		std::cout << std::hex << "[" << i*4 << "]: ";
 		for(int j = 0; j < 4; j++)
 			std::cout << unsigned(reinterpret_cast<uint8_t*>
-				(&dut->rootp->picorv_learn__DOT__sram0__DOT__sram0__DOT__memory[i])[j]) << " ";
+				(&dut->rootp->picorv_learn__DOT__sram0__DOT__memory[i])[j]) << " ";
 		std::cout << ";\t" <<
-			dut->rootp->picorv_learn__DOT__sram0__DOT__sram0__DOT__memory[i] << std::endl;
+			dut->rootp->picorv_learn__DOT__sram0__DOT__memory[i] << std::endl;
 	}
 }
 
@@ -158,6 +158,7 @@ int main(void) {
 	init_sim();
 	sim_reset(); // Reset
 	sim_load_fw();
+	dump_ram();
 	sim_run_prog();
 	dump_ram();
 	finish_sim();
