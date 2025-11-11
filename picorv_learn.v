@@ -1,58 +1,3 @@
-//module sram #(parameter BITS=32, parameter DEPTH=1024)
-//(
-//	input clk, input wr_en, input rd_en,
-//	input[$clog2(DEPTH) - 1 : 0] address,
-//	output reg[BITS - 1:0] data_out,
-//	input [BITS - 1:0] data_in,
-//	input [3:0] byte_en
-//);
-//
-//reg[BITS - 1:0] memory[DEPTH] /* verilator public_flat */;
-//always@(posedge clk) begin
-//	if(wr_en) begin
-//		if(byte_en[0])
-//			memory[address][7:0] <= data_in[7:0];
-//		if(byte_en[1])
-//			memory[address][15:8] <= data_in[15:8];
-//		if(byte_en[2])
-//			memory[address][23:16] <= data_in[23:16];
-//		if(byte_en[3])
-//			memory[address][31:24] <= data_in[31:24];
-//	end
-//	if(rd_en)
-//		data_out <= memory[address];
-//end
-//
-//endmodule
-
-//module sram_masked #(parameter BITS=32, parameter DEPTH=1024)
-//(
-//	input clk, input wr_en, input rd_en,
-//	input[$clog2(DEPTH) - 1: 0] address,
-//	output [BITS - 1:0] data_out,
-//	input [BITS - 1:0] data_in,
-//	input [3:0] byte_en,
-//	output reg valid
-//);
-//
-//wire[BITS - 1:0] masked_input;
-//wire[BITS - 1:0] sram0_output;
-//wire masked_rd_en;
-//assign masked_rd_en = rd_en | wr_en; // If writing, we need the stored data for masking
-//									 // If not reading or writing, keep this
-//									 // low
-//assign masked_input = data_in & mask | (sram0_output & ~(mask));
-//assign data_out = sram0_output & mask;
-//
-//sram sram0
-//(
-//	.clk(clk), .wr_en(wr_en), .rd_en(masked_rd_en),
-//	.address(address), .data_in(masked_input),
-//	.data_out(sram0_output)
-//);
-//endmodule
-
-
 module picorv_learn(input clk, input nRST,
 output reg[7:0] leds, output uart_tx_pin, input uart_rx_pin, output reg[7:0] dbg_sram);
 
@@ -127,24 +72,6 @@ always @* begin
 	else if (state == STATE_RUN_PROGRAM) begin
 		sram0_rd_en = (core0_wstrb == WSTRB_READ) && core0_mem_valid;
 		sram0_data_be = core0_wstrb;
-//		case(core0_wstrb)
-//			WSTRB_BYTE0:
-//				sram0_data_mask = 32'h000000ff;
-//			WSTRB_BYTE1:
-//				sram0_data_mask = 32'h0000ff00;
-//			WSTRB_BYTE2:
-//				sram0_data_mask = 32'h00ff0000;
-//			WSTRB_BYTE3:
-//				sram0_data_mask = 32'hff000000;
-//			WSTRB_HIGHER_HWORD:
-//				sram0_data_mask = 32'hffff0000;
-//			WSTRB_LOWER_HWORD:
-//				sram0_data_mask = 32'h0000ffff;
-//			WSTRB_WORD:
-//				sram0_data_mask = 32'hffffffff;
-//			default:
-//				sram0_data_mask = 32'hffffffff;
-//		endcase
 		sram0_addr_bus = core0_addr_bus[11:2]; // Ignore the first two bits because SRAM has a 1024*4K struct
 		sram0_data_in = core0_wdata_bus;
 		sram0_wr_en = (core0_wstrb != 0) && core0_mem_valid;
@@ -188,7 +115,6 @@ always @(posedge clk) begin
 		leds <= 0;
 	end
 	else begin
-//	dbg_sram <= sram[sram_wr_ptr];
 		case(state)
 			STATE_IDLE: begin
 				// Reset all necessary signals
@@ -258,7 +184,6 @@ always @(posedge clk) begin
 			STATE_RUN_PROGRAM: begin
 				core_reset <= 1; // Release reset on cores
 				if(core0_mem_valid) begin // Memory request has been placed, gets reset when mem_ready is set
-					//core0_rdata_bus <= sram0_data_out;
 					core0_mem_ready <= 1;
 				end else begin
 					core0_mem_ready <= 0; // If no request has been placed, deassert mem_ready
