@@ -1,6 +1,7 @@
-module picorv_learn(input clk, input nRST,
+module picorv_learn(input inclk, input nRST,
 output reg[7:0] leds, output uart_tx_pin, input uart_rx_pin, output reg[7:0] dbg_sram);
-
+wire clk;
+pll_100 pll0(.inclk0(inclk), .c0(clk));
 
 reg uart_start_read;
 wire uart_rd_avl;
@@ -68,6 +69,7 @@ always @* begin
 		sram0_addr_bus = sram_wr_ptr;
 		sram0_data_in = {4{read_data}}; // Since we use a mask, replicate the read byte
 		sram0_wr_en = uart_rd_avl & ~(uart_start_read); // Latch data in when output is valid
+		core0_rdata_bus = 0;
 	end
 	else if (state == STATE_RUN_PROGRAM) begin
 		sram0_rd_en = (core0_wstrb == WSTRB_READ) && core0_mem_valid;
@@ -83,6 +85,7 @@ always @* begin
 		sram0_data_in = 0;
 		sram0_data_be = 4'b1111;
 		sram0_wr_en = 0;
+		core0_rdata_bus = 0;
 	end
 	else begin
 		sram0_addr_bus = 0;
@@ -90,6 +93,7 @@ always @* begin
 		sram0_data_be = 4'b1111;
 		sram0_wr_en = 0;
 		sram0_rd_en = 0;
+		core0_rdata_bus = 0;
 	end
 end
 
@@ -161,7 +165,7 @@ always @(posedge clk) begin
 								mem_loader_counter <= mem_loader_counter + 1;
 							mem_loader_state <= STATE_MEMLOADER_START; // Return back to idle state
 							if(sram_wr_ptr == 10'd1023) begin // If all 1024 bytes have been loaded, start running the core
-								state <= STATE_RUN_PROGRAM;
+								state <= STATE_TRANSMIT_MEMORY_DEBUG;
 								mem_loader_state <= STATE_IDLE;
 							end
 						end else begin
