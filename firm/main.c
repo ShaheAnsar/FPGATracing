@@ -3,6 +3,12 @@
 
 #define OUTADDR ((volatile uint8_t*)(512))
 
+extern void * _core_private_start;
+extern void * _core_private_end;
+
+__attribute__((section("core_private")))volatile char private[4096] = { 'A', 'B', 'C' };
+__attribute__((section("core_shared")))volatile char shared[4096] = { 'D', 'E', 'F' };
+
 int fib(int n) {
 	if(n <= 0)
 		return 0;

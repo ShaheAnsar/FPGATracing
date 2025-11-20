@@ -1,3 +1,220 @@
+module core_unit
+(
+	input clk,
+	input nRST,
+	// Main interface
+	output reg mem_instr,
+	output reg mem_valid,
+	input mem_ready,
+	output reg [31:0] mem_addr,
+	output reg[ 3:0] wstrb,
+	input [31:0] data_in,
+	output reg [31:0] data_out,
+	output reg [7:0] fault,
+	output reg [7:0] flags,
+	// FW upload/dump interface
+	input nFW_mode,
+	input [31:0] fw_mem_addr,
+	input [31:0] fw_data_in,
+	output reg [31:0] fw_data_out,
+	input [3:0] fw_byte_en,
+	input fw_rd_en,
+	input fw_wr_en
+);
+
+reg sram_wr_en;
+reg sram_rd_en;
+reg[3:0] sram_byte_en;
+reg[9:0] sram_addr;
+wire[31:0] sram_data_out;
+reg[31:0] sram_data_in;
+
+sram sram_private(
+	.clk(clk), .rd_en(sram_rd_en), .wr_en(sram_wr_en),
+	.byte_en(sram_byte_en), .data_out(sram_data_out),
+	.data_in(sram_data_in), .address(sram_addr)
+); // Attached to core if address is between 0x2000 and 0x3000
+/*
+picorv32 core0(.clk(clk), .resetn(core_reset), .mem_valid(core0_mem_valid), .mem_ready(core0_mem_ready),
+					.mem_addr(core0_addr_bus), .mem_rdata(core0_rdata_bus), .mem_wdata(core0_wdata_bus),
+					.mem_wstrb(core0_wstrb));
+*/
+wire core_mem_valid;
+reg core_mem_ready;
+reg core_mem_ready_internal; // Used when access_private is true
+wire core_mem_instr;
+wire [31:0] core_mem_addr;
+reg [31:0] core_rdata;
+wire[31:0] core_wdata;
+wire[3:0] core_wstrb;
+picorv32 core(
+	.clk(clk), .resetn(nRST), .mem_valid(core_mem_valid),
+	.mem_ready(core_mem_ready), .mem_addr(core_mem_addr),
+	.mem_rdata(core_rdata), .mem_wdata(core_wdata),
+	.mem_wstrb(core_wstrb), .mem_instr(core_mem_instr)
+);
+
+
+wire access_private; // Is 1 if private memory is being accessed
+assign access_private = (core_mem_addr >= 32'h2000) && (core_mem_addr < 32'h3000);
+
+// Core-SRAM connections
+always @* begin /* Combinational Logic */
+	if(nFW_mode) begin /* In normal running mode */
+		if(access_private) begin /* private mem is between 0x2000-0x3000 */
+			sram_rd_en = core_mem_valid & (core_wstrb == 0);
+			sram_wr_en = (core_wstrb != 0) & (core_mem_valid);
+			sram_byte_en = core_wstrb;
+			sram_addr = core_mem_addr[11:2]; // Ignore the first two bits, all accesses are 4 aligned
+											 // Ignore bit 12 onwards, since
+											 // 0x2000 must be subtracted,
+											 // which is essentially the same
+											 // operation in this context
+			sram_data_in = core_wdata;
+			core_rdata = sram_data_out;
+			// Disable external interface
+			wstrb = 0;
+			mem_addr = 0;
+			data_out = 0;
+			mem_instr = 0;
+			mem_valid = 0;
+			core_mem_ready = core_mem_ready_internal;
+		end else begin
+			// Disable SRAM since the mem req is outside of its space
+			sram_rd_en = 0;
+			sram_wr_en = 0;
+			sram_byte_en = 0;
+			sram_addr = 0;
+			sram_data_in = 0;
+			// Send the data out onto the external mem bus
+			wstrb = core_wstrb;
+			mem_addr = core_mem_addr;
+			core_rdata = data_in;
+			data_out = core_wdata;
+			mem_instr = core_mem_instr;
+			mem_valid = core_mem_valid;
+			core_mem_ready = mem_ready;
+		end
+		// Disable FW interface
+		fw_data_out = 0;
+	end else begin /*Bypass core and give access to memory */
+		// Connect private SRAM to fw interface
+		sram_wr_en = fw_rd_en;
+		sram_rd_en = fw_rd_en;
+		sram_data_in = fw_data_in;
+		fw_data_out = sram_data_out;
+		sram_byte_en = fw_byte_en;
+		sram_addr = fw_mem_addr;
+		// Disable main interface
+		wstrb = 0;
+		mem_instr = 0;
+		mem_valid = 0;
+		mem_addr = 0;
+		data_out = 0;
+		// Disconnect core from memory
+		core_rdata = 0;
+		core_mem_ready = 0;
+	end
+end
+
+
+always @(posedge clk) begin
+	if(nFW_mode) begin // Normal running mode
+		if(access_private) begin // If the internal SRAM is used,
+								 //1 cycle latency is guaranteed
+								 // So, assert mem_ready with a one cycle
+								 // delay.
+								 // Otherwise, the external interface will
+								 // handle it
+			if(core_mem_ready_internal) // Clear existing mem_ready
+				core_mem_ready_internal <= 0;
+			else if(core_mem_valid) // If a mem_valid is asserted while mem_ready_internal is not,
+									// activate mem_ready_internal
+				core_mem_ready_internal <= 1;
+			else // For all other conditions keep it at 0
+				core_mem_ready_internal <= 0;
+		end
+	end
+	if(!nRST) begin
+		core_mem_ready_internal <= 0;
+	end
+end
+
+endmodule
+
+
+module wavefront // Collection of 4 core units
+#(parameter CORE_COUNT=4)
+( 
+	input clk, input nRST,
+	// Main Interface
+	output reg mem_instr,
+	output reg mem_valid,
+	input mem_ready,
+	output reg [31:0] mem_addr,
+	output reg [3:0] wstrb,
+	input [31:0] data_in,
+	output reg [31:0] data_out,
+	output reg [7:0] fault,
+	output reg [7:0] flags,
+	// FW upload/dump interface
+	input nFW_mode,
+	input [31:0] fw_mem_addr,
+	input [31:0] fw_data_in,
+	output reg [31:0] fw_data_out,
+	input [3:0] fw_byte_en,
+	input fw_rd_en,
+	input fw_wr_en
+);
+
+sram wave_local_sram();
+reg core_fault; // Fault active on any of the cores
+reg instr_lockstep_fault; // Instruction fetch is out of lockstep
+reg instr_addr; // Instruction address for comparison
+generate 
+	genvar i;
+	for(i = 0; i < CORE_COUNT; i++) begin : cores
+		wire mem_instr;
+		wire mem_valid;
+		reg mem_ready;
+		wire [31:0] mem_addr;
+		wire [3:0] wstrb;
+		wire [31:0] data_in;
+		wire [31:0] data_out;
+		wire [7:0] fault;
+		wire [7:0] flags;
+		wire nFW_mode;
+		wire [31:0] fw_mem_addr;
+		wire [31:0] fw_data_in;
+		wire [31:0] fw_data_out;
+		wire [31:0] fw_byte_en;
+		wire fw_rd_en;
+		wire fw_wr_en;
+		core_unit cu
+		(
+			.clk(clk), .nRST(nRST),
+			.
+		);
+	end
+endgenerate
+
+always @* begin /* Comb */
+	integer i;
+	core_fault = 1'd0;
+	instr_lockstep_fault = 1'd0;
+	for(i = 0; i < CORE_COUNT; i++) begin
+		core_fault = (| cores[i].fault) | core_fault;
+		instr_lockstep_fault = 
+	end
+end
+
+always @(posedge clk) begin /* Seq */
+	if(!nRST) begin
+	end
+end
+	// Fill in later
+endmodule
+
 module picorv_learn(input inclk, input nRST,
 output reg[7:0] leds, output uart_tx_pin, input uart_rx_pin, output reg[7:0] dbg_sram);
 wire clk;
