@@ -99,7 +99,7 @@ always @* begin /* Combinational Logic */
 		fw_data_out = 0;
 	end else begin /*Bypass core and give access to memory */
 		// Connect private SRAM to fw interface
-		sram_wr_en = fw_rd_en;
+		sram_wr_en = fw_wr_en;
 		sram_rd_en = fw_rd_en;
 		sram_data_in = fw_data_in;
 		fw_data_out = sram_data_out;
@@ -148,17 +148,19 @@ module wavefront // Collection of 4 core units
 ( 
 	input clk, input nRST,
 	// Main Interface
-	output reg mem_instr,
-	output reg mem_valid,
-	input mem_ready,
-	output reg [31:0] mem_addr,
-	output reg [3:0] wstrb,
-	input [31:0] data_in,
-	output reg [31:0] data_out,
+	output reg [CORE_COUNT - 1: 0] mem_instr,
+	output reg [CORE_COUNT - 1: 0] mem_valid,
+	input [CORE_COUNT - 1: 0] mem_ready,
+	output reg [CORE_COUNT*32 - 1:0] mem_addr,
+	output reg [CORE_COUNT*4 - 1:0] wstrb,
+	input [CORE_COUNT*32 - 1:0] data_in,
+	output reg [CORE_COUNT*32 - 1:0] data_out,
 	output reg [7:0] fault,
 	output reg [7:0] flags,
 	// FW upload/dump interface
 	input nFW_mode,
+	input [$clog2(CORE_COUNT) - 1:0] fw_core_select,
+	input fw_wave_select,
 	input [31:0] fw_mem_addr,
 	input [31:0] fw_data_in,
 	output reg [31:0] fw_data_out,
@@ -167,49 +169,262 @@ module wavefront // Collection of 4 core units
 	input fw_wr_en
 );
 
-sram wave_local_sram();
+reg sram_wr_en;
+reg sram_rd_en;
+reg[3:0] sram_byte_en;
+reg[9:0] sram_addr;
+wire[31:0] sram_data_out;
+reg[31:0] sram_data_in;
+
+sram wave_local_sram(
+	.clk(clk), .rd_en(sram_rd_en),
+	.wr_en(sram_wr_en), .byte_en(sram_byte_en),
+	.data_out(sram_data_out), .data_in(sram_data_in),
+	.address(sram_addr)
+);
+
+reg hw_fault; // Fault in the HDL
 reg core_fault; // Fault active on any of the cores
+reg [CORE_COUNT - 1:0] mem_instr_different; // Set to one if mem_instr is not the same
+reg [CORE_COUNT - 1:0] mem_addr_different; // Set to one if the memory address across all cores is not the same
 reg instr_lockstep_fault; // Instruction fetch is out of lockstep
-reg instr_addr; // Instruction address for comparison
+reg mem_fault; // All other memory faults
+reg access_private; // Denotes whether private memory is accessed or not
+wire wave_local_mem_req; // Set when a valid memory read has been placed during wave-local access
+reg wave_local_mem_ready;
+
+assign wave_local_mem_req = sram_rd_en && access_private;
+
 generate 
 	genvar i;
-	for(i = 0; i < CORE_COUNT; i++) begin : cores
+	for(i = 0; i < CORE_COUNT; i = i + 1) begin : cores
 		wire mem_instr;
 		wire mem_valid;
 		reg mem_ready;
 		wire [31:0] mem_addr;
 		wire [3:0] wstrb;
-		wire [31:0] data_in;
+		reg [31:0] data_in;
 		wire [31:0] data_out;
 		wire [7:0] fault;
 		wire [7:0] flags;
-		wire nFW_mode;
-		wire [31:0] fw_mem_addr;
-		wire [31:0] fw_data_in;
+		reg [31:0] fw_mem_addr;
+		reg [31:0] fw_data_in;
 		wire [31:0] fw_data_out;
-		wire [31:0] fw_byte_en;
-		wire fw_rd_en;
-		wire fw_wr_en;
+		reg [3:0] fw_byte_en;
+		reg fw_rd_en;
+		reg fw_wr_en;
 		core_unit cu
 		(
 			.clk(clk), .nRST(nRST),
-			.
+			.mem_instr(mem_instr), .mem_valid(mem_valid),
+			.mem_ready(mem_ready), .mem_addr(mem_addr),
+			.wstrb(wstrb), .data_in(data_in), .data_out(data_out),
+			.fault(fault), .flags(flags),
+			.nFW_mode(nFW_mode), .fw_mem_addr(fw_mem_addr),
+			.fw_data_in(fw_data_in), .fw_data_out(fw_data_out),
+			.fw_byte_en(fw_byte_en), .fw_rd_en(fw_rd_en),
+			.fw_wr_en(fw_wr_en)
 		);
+	end
+	genvar _i;
+	/* Check that mem_instr is the same across all cores */
+	for(_i = 1; _i < CORE_COUNT; _i = _i + 1) begin : mid_block
+		always @* begin
+			mem_instr_different[_i] = (cores[_i].mem_instr != cores[_i - 1].mem_instr);
+		end
+	end
+
+	/* Check the memory addresses are the same across all cores */
+	for(_i = 1; _i < CORE_COUNT; _i = _i + 1) begin : mad_block
+		always @* begin
+			for(j = 0; j < 31; j = j + 1) begin
+				mem_addr_different[_i] = (cores[_i].mem_addr[j] != cores[_i - 1].mem_addr[j]);
+			end
+		end
 	end
 endgenerate
 
+
+
+
+
+integer j;
 always @* begin /* Comb */
-	integer i;
-	core_fault = 1'd0;
-	instr_lockstep_fault = 1'd0;
-	for(i = 0; i < CORE_COUNT; i++) begin
-		core_fault = (| cores[i].fault) | core_fault;
-		instr_lockstep_fault = 
+	// Error Checking
+	/* Construct flags register */
+	hw_fault = 0;
+	core_fault = 0; // TODO: Actually create this
+	flags = 0;
+	instr_lockstep_fault = 0;
+	/* Private instruction memory is mapped to the first 1000 words */
+	access_private = (cores[0].mem_instr) && (cores[0].mem_addr < 32'h1000);
+	/* If data access is tried on the private space, we flag a mem fault */
+	mem_fault = (!cores[0].mem_instr) && (cores[0].mem_addr < 32'h1000);
+
+	instr_lockstep_fault = | mem_instr_different;
+	if(cores[0].mem_instr) begin
+		instr_lockstep_fault = instr_lockstep_fault | (| mem_addr_different);
+	end 
+	fault = {instr_lockstep_fault, mem_fault, core_fault};
+	// Memory wiring
+	mem_instr = 0;
+	mem_valid = 0;
+	mem_addr = 0;
+	wstrb = 0;
+	data_out = 0;
+	fw_data_out = 0;
+	cores[0].data_in = 0;
+	cores[1].data_in = 0;
+	cores[2].data_in = 0;
+	cores[3].data_in = 0;
+	// Disable core fw interface
+	// Manually unrolling loop at the moment because Verilator doesn't
+	// support for loops well
+	cores[0].fw_mem_addr = 0;
+	cores[0].fw_data_in = 0;
+	cores[0].fw_byte_en = 0;
+	cores[0].fw_wr_en = 0;
+	cores[0].fw_rd_en = 0;
+	cores[1].fw_mem_addr = 0;
+	cores[1].fw_data_in = 0;
+	cores[1].fw_byte_en = 0;
+	cores[1].fw_wr_en = 0;
+	cores[1].fw_rd_en = 0;
+	cores[2].fw_mem_addr = 0;
+	cores[2].fw_data_in = 0;
+	cores[2].fw_byte_en = 0;
+	cores[2].fw_wr_en = 0;
+	cores[2].fw_rd_en = 0;
+	cores[3].fw_mem_addr = 0;
+	cores[3].fw_data_in = 0;
+	cores[3].fw_byte_en = 0;
+	cores[3].fw_wr_en = 0;
+	cores[3].fw_rd_en = 0;
+	// We use core 0 as the reference when instructions are accessed
+	if(!nFW_mode) begin /* FW mode */
+		if(fw_wave_select) begin /* Wave local memory is selected */
+			// Enable SRAM fw interface
+			sram_addr = fw_mem_addr;
+			sram_data_in = fw_data_in;
+			fw_data_out = sram_data_out;
+			sram_byte_en = fw_byte_en;
+			sram_wr_en = fw_wr_en;
+			sram_rd_en = fw_rd_en;
+		end else begin /* Core memory is selected */
+			// Enable core fw interface
+			case(fw_core_select) 
+				0: begin
+					cores[0].fw_mem_addr = fw_mem_addr;
+					cores[0].fw_data_in = fw_data_in;
+					fw_data_out = cores[0].fw_data_out;
+					cores[0].fw_byte_en = fw_byte_en;
+					cores[0].fw_wr_en = fw_wr_en;
+					cores[0].fw_rd_en = fw_rd_en;
+				end
+				1: begin
+					cores[1].fw_mem_addr = fw_mem_addr;
+					cores[1].fw_data_in = fw_data_in;
+					fw_data_out = cores[1].fw_data_out;
+					cores[1].fw_byte_en = fw_byte_en;
+					cores[1].fw_wr_en = fw_wr_en;
+					cores[1].fw_rd_en = fw_rd_en;
+				end
+				2: begin
+					cores[2].fw_mem_addr = fw_mem_addr;
+					cores[2].fw_data_in = fw_data_in;
+					fw_data_out = cores[2].fw_data_out;
+					cores[2].fw_byte_en = fw_byte_en;
+					cores[2].fw_wr_en = fw_wr_en;
+					cores[2].fw_rd_en = fw_rd_en;
+				end
+				3: begin
+					cores[3].fw_mem_addr = fw_mem_addr;
+					cores[3].fw_data_in = fw_data_in;
+					fw_data_out = cores[3].fw_data_out;
+					cores[3].fw_byte_en = fw_byte_en;
+					cores[3].fw_wr_en = fw_wr_en;
+					cores[3].fw_rd_en = fw_rd_en;
+				end
+				default: begin
+					hw_fault = 1;
+				end
+			endcase
+			// Diable SRAM fw interface
+			sram_addr = 0;
+			sram_data_in = 0;
+			sram_byte_en = 0;
+			sram_wr_en = 0;
+			sram_rd_en = 0;
+		end
+	end else begin 
+		if(access_private) begin /* Access private mem */
+			// SRAM interface, read only
+			sram_addr = cores[0].mem_addr[11:2];
+			sram_data_in = 0; // Reads only!
+			cores[0].data_in = sram_data_out;
+			cores[0].mem_ready = wave_local_mem_ready;
+			cores[1].data_in = sram_data_out;
+			cores[1].mem_ready = wave_local_mem_ready;
+			cores[2].data_in = sram_data_out;
+			cores[2].mem_ready = wave_local_mem_ready;
+			cores[3].data_in = sram_data_out;
+			cores[3].mem_ready = wave_local_mem_ready;
+			sram_rd_en = cores[0].mem_valid && cores[0].mem_instr;
+			sram_wr_en = 0;
+			sram_byte_en = 0;
+		end else begin /* Cores are doing normal accesses, so pass interface to outside */
+			mem_instr[0] = cores[0].mem_instr;
+			mem_valid[0] = cores[0].mem_valid;
+			cores[0].mem_ready = mem_ready[0];
+			wstrb[0] = cores[0].wstrb;
+			mem_addr[31:0] = cores[0].mem_addr;
+			data_out[31:0] = cores[0].data_out;
+			cores[0].data_in = data_in[31:0];
+			mem_instr[1] = cores[1].mem_instr;
+			mem_valid[1] = cores[1].mem_valid;
+			cores[1].mem_ready = mem_ready[1];
+			wstrb[1] = cores[1].wstrb;
+			mem_addr[63:32] = cores[1].mem_addr;
+			data_out[63:32] = cores[1].data_out;
+			cores[1].data_in = data_in[63:32];
+			mem_instr[2] = cores[2].mem_instr;
+			mem_valid[2] = cores[2].mem_valid;
+			cores[2].mem_ready = mem_ready[2];
+			wstrb[2] = cores[2].wstrb;
+			mem_addr[95:64] = cores[2].mem_addr;
+			data_out[95:64] = cores[2].data_out;
+			cores[2].data_in = data_in[95:64];
+			mem_instr[3] = cores[3].mem_instr;
+			mem_valid[3] = cores[3].mem_valid;
+			cores[3].mem_ready = mem_ready[3];
+			wstrb[3] = cores[3].wstrb;
+			mem_addr[127:96] = cores[3].mem_addr;
+			data_out[127:96] = cores[3].data_out;
+			cores[3].data_in = data_in[127:96];
+
+			// Disable SRAM interface
+			sram_addr = 0;
+			sram_data_in = 0;
+			sram_rd_en = 0;
+			sram_wr_en = 0;
+			sram_byte_en = 0;
+		end
 	end
 end
 
 always @(posedge clk) begin /* Seq */
+	if(access_private && (nFW_mode)) begin
+		// Wave-local memory access
+		if(wave_local_mem_req) begin
+			wave_local_mem_ready <= 1;
+		end else begin
+			wave_local_mem_ready <= 0;
+		end
+	end 
+	
+
 	if(!nRST) begin
+		wave_local_mem_ready <= 0;
 	end
 end
 	// Fill in later
