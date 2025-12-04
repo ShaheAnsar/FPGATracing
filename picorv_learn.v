@@ -665,7 +665,7 @@ end
 
 generate
 genvar i;
-for(i = 0; i < 4; i++) begin : bit_i_wiring
+for(i = 0; i < 4; i = i + 1) begin : bit_i_wiring
 	always @* begin
 		data_in[(i + 1) * 32 - 1 -: 32]  = 0;
 		arbiter_addr[(i + 1 ) * SIZE - 1 -: SIZE] = 0;
@@ -864,37 +864,6 @@ end
 generate
 genvar i;
 for(i = 0; i < 4; i = i + 1) begin : blk_control_signals
-	//always @* begin
-	//	access_fb[i] = (wave_mem_addr[(i + 1) * 32 - 1 -: 32] >= 32'h3000) && ( wave_mem_addr[(i + 1) * 32 - 1 -: 32] < 32'h5000);
-	//	fb_wr_en[i] = wave_mem_valid[i] && (wave_wstrb[(i + 1) * 4 - 1 -: 4] != 0) && access_fb[i];
-	//	fb_rd_en[i] = wave_mem_valid[i] && (wave_wstrb[(i + 1) * 4 - 1 -: 4] == 0) && access_fb[i];
-	//	fb_request[i] = wave_mem_valid[i] && access_fb[i] && (!grant_record[i]);
-	//	wave_mem_ready[i] = fb_ready[i];
-	//	if(access_fb[i]) begin
-	//		fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = wave_mem_addr[i*32 +: 11];
-	//	end else begin
-	//		fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = 0;
-	//	end
-	//	if(!nFW_mode) begin
-	//		fb_wr_en[i] = 0;
-	//		fb_rd_en[i] = 0;
-	//		fb_request[i] = 0;
-	//		fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = 0;
-	//		wave_mem_ready[i] = 0;
-	//	end
-	//end
-
-	//always @(posedge clk) begin
-	//	if(fb_ready[i]) begin // Clear processed request grant
-	//		grant_record[i] <= 0;
-	//	end else if(fb_grant[i]) begin // A new request has been granted
-	//		grant_record[i] <= 1;
-	//	end
-	//	if(!nRST) begin
-	//		grant_record[i] <= 0;
-	//	end
-	//end
-
 	always @* begin
 		access_fb[i] = (wave_mem_addr[(i + 1) * 32 - 1 -: 32] >= 32'h3000) && ( wave_mem_addr[(i + 1) * 32 - 1 -: 32] < 32'h5000);
 		fb_wr_en[i] = wv0_mem_sync_arbiter_wr_en[i] && access_fb[i];
