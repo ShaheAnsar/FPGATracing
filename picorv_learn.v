@@ -376,28 +376,28 @@ always @* begin /* Comb */
 			mem_instr[0] = cores[0].mem_instr;
 			mem_valid[0] = cores[0].mem_valid;
 			cores[0].mem_ready = mem_ready[0];
-			wstrb[0] = cores[0].wstrb;
+			wstrb[3:0] = cores[0].wstrb;
 			mem_addr[31:0] = cores[0].mem_addr;
 			data_out[31:0] = cores[0].data_out;
 			cores[0].data_in = data_in[31:0];
 			mem_instr[1] = cores[1].mem_instr;
 			mem_valid[1] = cores[1].mem_valid;
 			cores[1].mem_ready = mem_ready[1];
-			wstrb[1] = cores[1].wstrb;
+			wstrb[7:4] = cores[1].wstrb;
 			mem_addr[63:32] = cores[1].mem_addr;
 			data_out[63:32] = cores[1].data_out;
 			cores[1].data_in = data_in[63:32];
 			mem_instr[2] = cores[2].mem_instr;
 			mem_valid[2] = cores[2].mem_valid;
 			cores[2].mem_ready = mem_ready[2];
-			wstrb[2] = cores[2].wstrb;
+			wstrb[11:8] = cores[2].wstrb;
 			mem_addr[95:64] = cores[2].mem_addr;
 			data_out[95:64] = cores[2].data_out;
 			cores[2].data_in = data_in[95:64];
 			mem_instr[3] = cores[3].mem_instr;
 			mem_valid[3] = cores[3].mem_valid;
 			cores[3].mem_ready = mem_ready[3];
-			wstrb[3] = cores[3].wstrb;
+			wstrb[15:12] = cores[3].wstrb;
 			mem_addr[127:96] = cores[3].mem_addr;
 			data_out[127:96] = cores[3].data_out;
 			cores[3].data_in = data_in[127:96];
@@ -428,6 +428,497 @@ always @(posedge clk) begin /* Seq */
 	end
 end
 	// Fill in later
+endmodule
+
+module debug_fb// Use sram during debug
+#
+(
+	parameter PORTS=8,
+	parameter DEPTH=2048
+)
+(
+	input clk, input nRST,
+	// Main Interface
+	input [$clog2(DEPTH) * (PORTS) - 1 : 0] addr,
+	input [32 * (PORTS) - 1 : 0] data_in,
+	input [4 * PORTS - 1 : 0] byte_en,
+	input [PORTS - 1 : 0] wr_en,
+	input [PORTS - 1 : 0] rd_en,
+	input [PORTS - 1 : 0] request,
+	output reg [32 * PORTS - 1 : 0] data_out,
+	output reg [PORTS - 1 : 0] grant,
+	output reg [PORTS - 1 : 0] ready,
+	output fault,
+	// FW interface
+	input nFW_mode,
+	input [$clog2(DEPTH) - 1 : 0] fw_mem_addr,
+	input [31:0] fw_data_in,
+	input [3:0] fw_byte_en,
+	input fw_rd_en,
+	input fw_wr_en,
+	output reg [31:0] fw_data_out
+);
+
+localparam SIZE = $clog2(DEPTH);
+
+
+reg [SIZE - 1 : 0] fb_mem_addr;
+reg [31 : 0] fb_data_in;
+wire [31 : 0] fb_data_out;
+reg fb_rd_en;
+reg fb_wr_en;
+reg [3:0] fb_byte_en;
+
+sram #(.DEPTH(DEPTH)) sram_fb
+(
+	.clk(clk),  .wr_en(fb_wr_en),
+	.rd_en(fb_rd_en), .address(fb_mem_addr),
+	.data_out(fb_data_out), .data_in(fb_data_in),
+	.byte_en(fb_byte_en)
+);
+
+reg prio_enc_fault;
+reg pipeline_fault;
+reg req_fault;
+
+assign fault = prio_enc_fault | pipeline_fault | req_fault;
+
+reg [2:0] current_req;
+reg current_req_valid;
+
+/* Prio Enc */
+always @* begin
+	current_req_valid = 1;
+	prio_enc_fault = 0;
+	if(request == 0) begin /* No request */
+		current_req_valid = 0;
+		current_req = 3'd0;
+	end else if(request & 1) begin /* LSB request is given priority */
+		current_req = 3'd0;
+	end else if (request & (1 << 1)) begin
+		current_req = 3'd1;
+	end else if (request & (1 << 2)) begin
+		current_req = 3'd2;
+	end else if (request & (1 << 3)) begin
+		current_req = 3'd3;
+	end else if (request & (1 << 4)) begin
+		current_req = 3'd4;
+	end else if (request & (1 << 5)) begin
+		current_req = 3'd5;
+	end else if (request & (1 << 6)) begin
+		current_req = 3'd6;
+	end else if (request & (1 << 7)) begin
+		current_req = 3'd7;
+	end else begin
+		current_req_valid = 0;
+		current_req = 3'd0;
+		prio_enc_fault = 1;
+	end
+end
+
+localparam STATE_IDLE = 3'd0;
+localparam STATE_CHOOSE = 3'd1;
+localparam STATE_GRANT = 3'd2;
+localparam STATE_PROCESS = 3'd3;
+localparam STATE_OUTPUT = 3'd4;
+
+reg[2:0] state;
+/* Stage A */
+reg[SIZE - 1:0] req_addr;
+reg[31:0] req_data_in;
+reg[3:0] req_byte_en;
+reg[2:0] req_id;
+reg req_rd_en;
+reg req_wr_en;
+reg pipeline_stage_A_valid;
+/* Stage B */
+reg[2:0] req_id_B;
+reg req_wr_en_B;
+reg req_rd_en_B;
+reg pipeline_stage_B_valid;
+/* Stage C */
+reg[2:0] req_id_C;
+reg req_wr_en_C;
+reg req_rd_en_C;
+reg[31:0] req_data_out;
+reg pipeline_stage_C_valid;
+
+/* SRAM pipeline connections */
+always @* begin
+	grant = (current_req_valid)?(1 << current_req):0;
+	if(pipeline_stage_A_valid) begin /* Request is valid */
+		fb_mem_addr = req_addr;
+		fb_data_in = req_data_in;
+		fb_rd_en = req_rd_en;
+		fb_wr_en = req_wr_en;
+		fb_byte_en = req_byte_en;
+	end else begin /* Request invalid, disconnect */
+		fb_mem_addr = 0;
+		fb_data_in = 0;
+		fb_rd_en = 0;
+		fb_wr_en = 0;
+		fb_byte_en = 0;
+		data_out = 0;
+	end
+
+	if(pipeline_stage_C_valid) begin /* Output valid */
+		ready = (1 << req_id_C); // Assert mem_ready for the relevant bus
+		data_out = 0;
+		data_out[(req_id_C + 1) * 32 - 1 -: 32] = req_data_out;
+	end else begin /* Output invalid, disconnect */
+		ready = 0;
+		data_out = 0;
+	end
+end
+
+always @(posedge clk) begin
+	/* Acquire state */
+	if( | request) begin /* Request Available */
+		req_addr <= addr[(current_req + 1) * SIZE - 1 -: SIZE];
+		req_data_in <= data_in[(current_req + 1) * 32 - 1 -: 32];
+		req_byte_en <= byte_en[(current_req + 1) * 4 - 1 -: 4];
+		req_rd_en <= rd_en[current_req];
+		req_wr_en <= wr_en[current_req];
+		req_id <= current_req;
+		pipeline_stage_A_valid <= 1;
+	end else begin
+		pipeline_stage_A_valid <= 0;
+	end
+
+	if(pipeline_stage_A_valid) begin /* Commit to RAM */
+		req_id_B <= req_id;
+		req_wr_en_B <= req_wr_en;
+		req_rd_en_B <= req_rd_en;
+		pipeline_stage_B_valid <= 1;
+	end else begin
+		pipeline_stage_B_valid <= 0;
+	end
+
+	if(pipeline_stage_B_valid) begin /* Output to BUS */
+		req_id_C <= req_id_B;
+		if(req_rd_en_B) begin /* Read request */
+			req_data_out <= fb_data_out;
+		end
+		pipeline_stage_C_valid <= 1;
+	end else begin
+		pipeline_stage_C_valid <= 0;
+	end
+
+	if(!nRST) begin
+		req_addr <= 0;
+		req_data_in <= 0;
+		req_byte_en <= 0;
+		req_wr_en <= 0;
+		req_rd_en <= 0;
+		req_id <= 0;
+		pipeline_stage_A_valid <= 0;
+		pipeline_stage_B_valid <= 0;
+	end
+end
+
+endmodule
+
+module mem_sync
+#(
+	parameter DEPTH=2048 /* Depth of the FB in words */
+)
+(
+	input clk, input nRST,
+	// Connects to wavefront
+	input [3:0] mem_instr,
+	input [3:0] mem_valid,
+	output reg [3:0] mem_ready,
+	input [127:0] mem_addr,
+	input [15:0] wstrb,
+	output reg [127:0] data_in, /* Connects to data_in */
+	input [127:0] data_out, /* Connects to data_out */
+	// Connects to arbiter
+	output reg [$clog2(DEPTH)*4 - 1:0] arbiter_addr,
+	input [127:0] arbiter_data_out, /* Connects to data_out */
+	output reg [127:0] arbiter_data_in,  /* Connects to data_in */
+	output reg [3:0] arbiter_wr_en,
+	output reg [3:0] arbiter_rd_en,
+	output reg [15:0] arbiter_byte_en,
+	output reg [3:0] arbiter_request,
+	input [3:0] arbiter_grant,
+	input [3:0] arbiter_ready
+);
+
+localparam SIZE = $clog2(DEPTH);
+
+
+reg [127:0] latched_arbiter_data_out;
+
+reg [3:0] received_grant;
+reg [3:0] serviced_requests;
+
+reg [3:0] wave_ready_reg;
+
+localparam IDLE = 3'd0;
+localparam PENDING = 3'd1;
+localparam FINISH = 3'd2;
+reg [2:0] state;
+
+always @* begin
+	mem_ready = wave_ready_reg;
+end
+
+generate
+genvar i;
+for(i = 0; i < 4; i++) begin : bit_i_wiring
+	always @* begin
+		data_in[(i + 1) * 32 - 1 -: 32]  = 0;
+		arbiter_addr[(i + 1 ) * SIZE - 1 -: SIZE] = 0;
+		arbiter_data_in[(i + 1 ) *32 - 1 -: 32] = 0;
+		arbiter_wr_en[i] = 0;
+		arbiter_rd_en[i] = 0;
+		arbiter_request[i] = 0;
+		arbiter_byte_en[(i + 1) * 4 - 1 -: 4] = 0;
+		if(state == PENDING) begin
+			arbiter_addr[(i + 1 ) * SIZE - 1 -: SIZE] = mem_addr[i * 32 +: SIZE];
+			arbiter_data_in[(i + 1) * 32 - 1 -: 32] = data_out[(i + 1) * 32 - 1 -: 32 ];
+			arbiter_wr_en[i] = (mem_valid[i]) && (wstrb[(i + 1) * 4 - 1 -: 4] != 0);
+			arbiter_rd_en[i] = (mem_valid[i]) && (wstrb[(i + 1) * 4 - 1 -: 4] == 0);
+			arbiter_byte_en[(i + 1) * 4 - 1 -: 4] = wstrb[(i + 1) * 4 - 1 -: 4];
+			data_in[(i + 1) * 32 - 1 -: 32] = latched_arbiter_data_out[(i + 1) * 32 - 1 -: 32];
+			arbiter_request[i] = mem_valid[i] && (~received_grant[i]);
+		end 
+	end
+end
+endgenerate
+
+always @(posedge clk) begin
+	case(state)
+		IDLE : begin
+			received_grant <= 0;
+			serviced_requests <= 0;
+			latched_arbiter_data_out <= 0;
+			wave_ready_reg <= 0;
+			if(| mem_valid) begin // Latch in memory requests
+				state <= PENDING;
+			end
+		end
+		PENDING: begin
+			latched_arbiter_data_out <= arbiter_data_out | latched_arbiter_data_out; // Compound data_outs
+			received_grant <= received_grant | arbiter_grant; // Update grants that have been received;
+			serviced_requests <= serviced_requests | arbiter_ready; // Update all the ready requests
+			if(serviced_requests == 4'b1111) begin
+				wave_ready_reg <= serviced_requests;
+				state <= IDLE;
+			end
+		end
+	endcase
+
+
+	if(!nRST) begin
+		state <= IDLE;
+		received_grant  <= 0;
+		serviced_requests <= 0;
+		latched_arbiter_data_out <= 0;
+		wave_ready_reg <= 0;
+	end
+end
+endmodule
+
+// Meant for 4 cores atm
+module simple_gpu
+(
+	input clk, input nRST,
+	// FW interface
+	input nFW_mode,
+	input [3:0] fw_core_select,
+	input fw_wave_select,
+	input [31:0] fw_mem_addr,
+	input [31:0] fw_data_in,
+	output reg [31:0] fw_data_out,
+	input [3:0] fw_byte_en,
+	input fw_rd_en,
+	input fw_wr_en
+);
+
+reg [3:0] wv0_mem_sync_mem_instr;
+reg [3:0] wv0_mem_sync_mem_valid;
+wire [3:0] wv0_mem_sync_mem_ready;
+reg [127:0] wv0_mem_sync_mem_addr;
+reg [15:0] wv0_mem_sync_wstrb;
+wire [127:0] wv0_mem_sync_data_in;
+reg [127:0] wv0_mem_sync_data_out;
+
+wire [43:0] wv0_mem_sync_arbiter_addr;
+reg [127:0] wv0_mem_sync_arbiter_data_out;
+wire [127:0] wv0_mem_sync_arbiter_data_in;
+wire [3:0] wv0_mem_sync_arbiter_wr_en;
+wire [3:0] wv0_mem_sync_arbiter_rd_en;
+wire [15:0] wv0_mem_sync_arbiter_byte_en;
+wire [3:0] wv0_mem_sync_arbiter_request;
+reg [3:0] wv0_mem_sync_arbiter_grant;
+reg [3:0] wv0_mem_sync_arbiter_ready;
+
+
+mem_sync wv0_mem_sync
+(
+	.clk(clk), .nRST(nRST),
+	//WV
+	.mem_instr(wv0_mem_sync_mem_instr),
+	.mem_valid(wv0_mem_sync_mem_valid),
+	.mem_ready(wv0_mem_sync_mem_ready),
+	.mem_addr(wv0_mem_sync_mem_addr),
+	.wstrb(wv0_mem_sync_wstrb),
+	.data_in(wv0_mem_sync_data_in),
+	.data_out(wv0_mem_sync_data_out),
+	//MEM
+	.arbiter_addr(wv0_mem_sync_arbiter_addr),
+	.arbiter_data_out(wv0_mem_sync_arbiter_data_out),
+	.arbiter_data_in(wv0_mem_sync_arbiter_data_in),
+	.arbiter_wr_en(wv0_mem_sync_arbiter_wr_en),
+	.arbiter_rd_en(wv0_mem_sync_arbiter_rd_en),
+	.arbiter_byte_en(wv0_mem_sync_arbiter_byte_en),
+	.arbiter_request(wv0_mem_sync_arbiter_request),
+	.arbiter_grant(wv0_mem_sync_arbiter_grant),
+	.arbiter_ready(wv0_mem_sync_arbiter_ready)
+);
+
+
+reg [7:0] fb_wr_en;
+reg [7:0] fb_rd_en;
+reg [255:0] fb_byte_en;
+reg [255:0] fb_data_in;
+reg [87:0] fb_mem_addr;
+reg [7:0] fb_request;
+wire [7:0] fb_grant;
+wire [7:0] fb_ready;
+wire [31:0] fb_data_out;
+
+debug_fb fb 
+(
+	.clk(clk), .nRST(nRST),
+	.wr_en(fb_wr_en), .rd_en(fb_rd_en),
+	.addr(fb_mem_addr),
+	.data_out(fb_data_out), .data_in(fb_data_in),
+	.byte_en(fb_byte_en), .grant(fb_grant),
+	.request(fb_request), .ready(fb_ready)
+);// Mapped from
+
+wire [3:0] wave_mem_instr;
+wire [3:0] wave_mem_valid;
+reg [3:0] wave_mem_ready;
+wire [127:0] wave_mem_addr;
+wire [15:0] wave_wstrb;
+reg [127:0] wave_data_in;
+wire [127:0] wave_data_out;
+wavefront wv0
+(
+	.clk(clk), .nRST(nRST),
+	.mem_addr(wave_mem_addr),
+	.data_in(wave_data_in), .data_out(wave_data_out),
+	.wstrb(wave_wstrb), .mem_ready(wave_mem_ready),
+	.mem_valid(wave_mem_valid), .mem_instr(wave_mem_instr),
+	//FW intfc
+	.nFW_mode(nFW_mode), .fw_core_select(fw_core_select),
+	.fw_wave_select(fw_wave_select), .fw_mem_addr(fw_mem_addr),
+	.fw_data_in(fw_data_in), .fw_data_out(fw_data_out),
+	.fw_byte_en(fw_byte_en), .fw_rd_en(fw_rd_en),
+	.fw_wr_en(fw_wr_en)
+);
+
+reg [3:0] access_fb /* verilator lint_off UNOPTFLAT */;
+// Wavefront - FB connection
+
+//always @*begin
+//	if(access_fb) begin
+//		fb_byte_en = wave_wstrb;
+//		fb_data_in = wave_data_out;
+//		wave_data_in = fb_data_out;
+//	end else begin
+//		fb_byte_en = 0;
+//		fb_data_in = 0;
+//		wave_data_in = 0;
+//	end
+//end
+
+always @*begin
+	fb_byte_en = wv0_mem_sync_arbiter_byte_en;
+	fb_data_in = wv0_mem_sync_arbiter_data_in;
+	wv0_mem_sync_arbiter_data_out = fb_data_out;
+	wv0_mem_sync_arbiter_grant = fb_grant;
+	if(access_fb) begin
+		wave_data_in = wv0_mem_sync_data_in;
+		wv0_mem_sync_wstrb = wave_wstrb;
+		wv0_mem_sync_data_out = wave_data_out;
+		//wv0_mem_sync_mem_addr = (wave_mem_addr - 32'h3000);
+		//wv0_mem_sync_mem_addr = wv0_mem_sync_mem_addr[12:2];
+		wv0_mem_sync_mem_valid = wave_mem_valid;
+		wv0_mem_sync_mem_instr = wave_mem_instr;
+		wave_mem_ready = wv0_mem_sync_mem_ready;
+	end else begin
+		wave_data_in = 0;
+		wv0_mem_sync_wstrb = 0;
+		wv0_mem_sync_data_out = 0;
+		//wv0_mem_sync_mem_addr = 0;
+		wv0_mem_sync_mem_valid = 0;
+		wv0_mem_sync_mem_instr = 0;
+		wave_mem_ready = 0;
+	end
+end
+
+generate
+genvar i;
+for(i = 0; i < 4; i = i + 1) begin : blk_control_signals
+	//always @* begin
+	//	access_fb[i] = (wave_mem_addr[(i + 1) * 32 - 1 -: 32] >= 32'h3000) && ( wave_mem_addr[(i + 1) * 32 - 1 -: 32] < 32'h5000);
+	//	fb_wr_en[i] = wave_mem_valid[i] && (wave_wstrb[(i + 1) * 4 - 1 -: 4] != 0) && access_fb[i];
+	//	fb_rd_en[i] = wave_mem_valid[i] && (wave_wstrb[(i + 1) * 4 - 1 -: 4] == 0) && access_fb[i];
+	//	fb_request[i] = wave_mem_valid[i] && access_fb[i] && (!grant_record[i]);
+	//	wave_mem_ready[i] = fb_ready[i];
+	//	if(access_fb[i]) begin
+	//		fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = wave_mem_addr[i*32 +: 11];
+	//	end else begin
+	//		fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = 0;
+	//	end
+	//	if(!nFW_mode) begin
+	//		fb_wr_en[i] = 0;
+	//		fb_rd_en[i] = 0;
+	//		fb_request[i] = 0;
+	//		fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = 0;
+	//		wave_mem_ready[i] = 0;
+	//	end
+	//end
+
+	//always @(posedge clk) begin
+	//	if(fb_ready[i]) begin // Clear processed request grant
+	//		grant_record[i] <= 0;
+	//	end else if(fb_grant[i]) begin // A new request has been granted
+	//		grant_record[i] <= 1;
+	//	end
+	//	if(!nRST) begin
+	//		grant_record[i] <= 0;
+	//	end
+	//end
+
+	always @* begin
+		access_fb[i] = (wave_mem_addr[(i + 1) * 32 - 1 -: 32] >= 32'h3000) && ( wave_mem_addr[(i + 1) * 32 - 1 -: 32] < 32'h5000);
+		fb_wr_en[i] = wv0_mem_sync_arbiter_wr_en[i] && access_fb[i];
+		fb_rd_en[i] = wv0_mem_sync_arbiter_rd_en[i] && access_fb[i];
+		fb_request[i] = wv0_mem_sync_arbiter_request[i] && access_fb[i];
+		wv0_mem_sync_arbiter_ready[i] = fb_ready[i];
+		fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = wv0_mem_sync_arbiter_addr[(i + 1) * 11 - 1 -: 11 ];
+		if(access_fb) begin
+			wv0_mem_sync_mem_addr[i * 32 +: 32] = (wave_mem_addr[i*32 +: 32] - 32'h3000);
+			wv0_mem_sync_mem_addr[i * 32 +: 32] = wv0_mem_sync_mem_addr[i * 32 + 2 +: 30] ;
+		end else begin
+			wv0_mem_sync_mem_addr[i * 32 +: 32] = 0;
+		end
+		if(!nFW_mode) begin
+			fb_wr_en[i] = 0;
+			fb_rd_en[i] = 0;
+			fb_request[i] = 0;
+			fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = 0;
+		end
+	end
+
+end
+endgenerate
+
 endmodule
 
 module picorv_learn(input inclk, input nRST,
