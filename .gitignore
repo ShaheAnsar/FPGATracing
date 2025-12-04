@@ -1,0 +1,8 @@
+*
+!*.v
+!*.c
+!*.sv
+!simulation/*.c
+!simulation/*.cpp
+!firm/*.c
+!.gitignore
