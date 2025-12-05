@@ -890,204 +890,473 @@ endgenerate
 
 endmodule
 
-module picorv_learn(input inclk, input nRST,
-output reg[7:0] leds, output uart_tx_pin, input uart_rx_pin, output reg[7:0] dbg_sram);
-wire clk;
-pll_100 pll0(.inclk0(inclk), .c0(clk));
+module picorv_learn
+(
+	input inclk, input nRST,
+	output reg [7:0] leds, output uart_tx_pin,
+	input uart_rx_pin
+);
 
-reg uart_start_read;
-wire uart_rd_avl;
-wire uart_rx_busy;
-wire [7:0] read_data;
+	.nFW_mode(nFW_mode), .fw_core_select(fw_core_select),
+	.fw_wave_select(fw_wave_select), .fw_mem_addr(fw_mem_addr),
+	.fw_data_in(fw_data_in), .fw_data_out(fw_data_out),
+	.fw_byte_en(fw_byte_en), .fw_rd_en(fw_rd_en),
+	.fw_wr_en(fw_wr_en)
 
-reg core_reset;
-wire[31:0] core0_addr_bus;
-wire[31:0] core0_wdata_bus;
-reg[31:0] core0_rdata_bus;
-wire[3:0] core0_wstrb; // Write strobe
-localparam WSTRB_READ = 4'd0;
-localparam WSTRB_BYTE0 = 4'd1;
-localparam WSTRB_BYTE1 = 4'd2;
-localparam WSTRB_BYTE2 = 4'd4;
-localparam WSTRB_BYTE3 = 4'd8;
-localparam WSTRB_LOWER_HWORD = 4'd3;
-localparam WSTRB_HIGHER_HWORD = 4'd12;
-localparam WSTRB_WORD = 4'd15;
-wire core0_mem_valid; // core asserts 1 when a request is placed on the bus
-reg core0_mem_ready; // peripheral asserts 1 when memory is ready to respond
-
-reg[7:0] state;
-reg[7:0] mem_loader_state;
-reg[2:0] mem_loader_counter;
-localparam STATE_IDLE = 8'b0;
-localparam STATE_LOAD_MEMORY = 8'd1;
-localparam STATE_TRANSMIT_MEMORY_DEBUG = 8'd3;
-localparam STATE_RUN_PROGRAM = 8'd2;
-localparam STATE_MEMLOADER_START = 8'd1;
-localparam STATE_MEMLOADER_LATCH = 8'd2;
-localparam STATE_MEMLOADER_WAIT = 8'd3;
-localparam STATE_MEMLOADER_WRITE = 8'd4;
-
-reg sram0_wr_en;
-reg sram0_rd_en;
-reg[9:0] sram0_addr_bus;
-reg[31:0] sram0_data_in;
-reg[3:0] sram0_data_be;
-wire[31:0] sram0_data_out;
-sram sram0(
-	.clk(clk), .rd_en(sram0_rd_en), .wr_en(sram0_wr_en),
-	.data_in(sram0_data_in), .data_out(sram0_data_out),
-	.address(sram0_addr_bus), .byte_en(sram0_data_be)
-); //1K*4B SRAM
-reg[9:0] sram_rd_ptr;
-reg[9:0] sram_wr_ptr;
-
-always @* begin
-	if(state == STATE_LOAD_MEMORY) begin
-		sram0_rd_en = 0;
-		case(mem_loader_counter)
-			0:
-				sram0_data_be = 4'b1;
-			1:
-				sram0_data_be = 4'b10;
-			2:
-				sram0_data_be = 4'b100;
-			3:
-				sram0_data_be = 4'b1000;
-			default: begin
-				sram0_data_be = 4'b1111;
-			end
-		endcase
-		sram0_addr_bus = sram_wr_ptr;
-		sram0_data_in = {4{read_data}}; // Since we use a mask, replicate the read byte
-		sram0_wr_en = uart_rd_avl & ~(uart_start_read); // Latch data in when output is valid
-		core0_rdata_bus = 0;
-	end
-	else if (state == STATE_RUN_PROGRAM) begin
-		sram0_rd_en = (core0_wstrb == WSTRB_READ) && core0_mem_valid;
-		sram0_data_be = core0_wstrb;
-		sram0_addr_bus = core0_addr_bus[11:2]; // Ignore the first two bits because SRAM has a 1024*4K struct
-		sram0_data_in = core0_wdata_bus;
-		sram0_wr_en = (core0_wstrb != 0) && core0_mem_valid;
-		core0_rdata_bus = sram0_data_out;
-	end
-	else if (state == STATE_TRANSMIT_MEMORY_DEBUG) begin
-		sram0_rd_en = 1;
-		sram0_addr_bus = sram_rd_ptr;
-		sram0_data_in = 0;
-		sram0_data_be = 4'b1111;
-		sram0_wr_en = 0;
-		core0_rdata_bus = 0;
-	end
-	else begin
-		sram0_addr_bus = 0;
-		sram0_data_in = 0;
-		sram0_data_be = 4'b1111;
-		sram0_wr_en = 0;
-		sram0_rd_en = 0;
-		core0_rdata_bus = 0;
-	end
-end
+reg nFW_mode;
+reg [3:0] fw_core_select;
+reg [31:0] fw_mem_addr;
+reg [31:0] fw_data_out;
+reg fw_rd_en;
+reg fw_wr_en;
+reg [3:0] fw_byte_en;
+reg [31:0] fw_data_in;
+reg fw_wave_select;
 
 
+reg urx_start_read;
+wire urx_read_avl;
+wire urx_read_data;
+wire urx_busy;
+uart_rx urx(
+	.clk(clk), .n_reset(nRST),
+	.rx_pin(uart_rx_pin), .start_read(urx_start_read),
+	.read_avl(urx_rd_avl), .read_data(urx_read_data),
+	.busy(urx_busy)
+);
 
-uart_rx urx(.clk(clk), .n_reset(nRST), .rx_pin(uart_rx_pin), .start_read(uart_start_read),
-				.read_avl(uart_rd_avl), .read_data(read_data), .busy(uart_rx_busy));
+reg utx_start_write;
+reg [7:0] utx_write_data;
+wire utx_write_avl;
+uart_tx utx(
+	.clk(clk), .n_reset(nRST),
+	.tx_pin(uart_tx_pin), .start_write(utx_start_write),
+	.write_avl(utx_write_avl), .write_data(utx_write_data)
+);
 
-picorv32 core0(.clk(clk), .resetn(core_reset), .mem_valid(core0_mem_valid), .mem_ready(core0_mem_ready),
-					.mem_addr(core0_addr_bus), .mem_rdata(core0_rdata_bus), .mem_wdata(core0_wdata_bus),
-					.mem_wstrb(core0_wstrb));
+reg [15:0] read_counter;
+reg [15:0] write_counter;
+reg [31:0] word;
+reg [2:0] word_counter;
 
+localparam STATE_START_SYNC_READ = 4'd0;
+localparam STATE_START_READ = 4'd1; // Read from UART
+localparam STATE_READ_BYTE = 4'd2;
+localparam STATE_STORE_WORD = 4'd3;
+localparam STATE_START_WRITE = 4'd4; // Write to UART
+localparam STATE_LOAD_WORD = 4'd5;
+localparam STATE_WRITE_BYTE = 4'd6;
+localparam STATE_CHECK_SYNC_READ = 4'd7;
+localparam STATE_RUN_PROGRAM = 4'd8;
+reg [3:0] state;
+
+/* Load FW */
 always @(posedge clk) begin
-	if(!nRST)begin
+	case(state)
+		STATE_START_SYNC_READ: begin
+			if(urx_read_avl) begin
+				urx_read_start <= 1;
+				state <= STATE_CHECK_SYNC_READ;
+			end
+		end
+		STATE_CHECK_SYNC_READ: begin
+			urx_read_start <= 0;
+			if(urx_busy == 0) begin /* Read has completed */
+				if(urx_read_data == "S") begin /* Sync byte received */
+					state <= STATE_START_READ; /* Start loading fw */
+				end else begin
+					state <= STATE_START_SYNC_READ; /* Read again */
+				end
+			end
+		end
+		STATE_START_READ: begin
+			if(urx_read_avl) begin
+				urx_read_start <= 1;
+				state <= STATE_READ_BYTE;
+			end
+		end
+		STATE_READ_BYTE: begin
+			fw_wr_en <= 0;
+			urx_read_start <= 0;
+			if(!urx_busy) begin
+				if(word_counter < 4) begin
+					word <= {urx_read_data, word[23:0]};
+					word_counter <= word_counter + 1;
+				end
+				else begin
+					state <= STATE_STORE_WORD;
+					word_counter <= 0;
+				end
+			end
+		end
+		STATE_STORE_WORD: begin
+			if(read_counter < 16'h1400) begin
+				fw_mem_addr <= read_counter;
+				fw_data_in <= word;
+				fw_byte_en <= 4'b1111;
+				fw_wr_en <= 1;
+				read_counter <= read_counter + 1;
+				state <= STATE_START_READ;
+			end else begin
+				read_counter <= 0;
+				state <= STATE_RUN_PROGRAM;
+			end
+		end
+		STATE_RUN_PROGRAM: begin
+		end
+		default: begin
+			leds[0] <= 1; // Show fault
+		end
+	endcase
+	if(nRST) begin
 		state <= STATE_IDLE;
-		mem_loader_state <= STATE_IDLE;
-		mem_loader_counter <= 0;
-		core_reset <= 0; // Keep all cores reset till data is available;
-		core0_mem_ready <= 0;
-		sram_rd_ptr <= 0;
-		sram_wr_ptr <= 0;
-		uart_start_read <= 0;
+		read_counter <= 0;
+		word <= 0;
+		word_counter <= 0;
+		write_counter <= 0;
 		leds <= 0;
 	end
-	else begin
-		case(state)
-			STATE_IDLE: begin
-				// Reset all necessary signals
-				mem_loader_counter <= 0;
-				uart_start_read <= 0;
-				sram_rd_ptr <= 0;
-				sram_wr_ptr <= 0;
-				state <= STATE_LOAD_MEMORY;
-				leds[0] <= 1;
-			end
-			STATE_LOAD_MEMORY: begin
-				case(mem_loader_state)
-					STATE_IDLE: begin // Wait till data is given
-						if(uart_rd_avl) begin
-							uart_start_read <= 0;
-							if(read_data == "S") begin
-								mem_loader_state <= STATE_MEMLOADER_START;
-							end else begin
-								mem_loader_state <= STATE_IDLE;
-							end
-						end else if(!uart_rx_busy) begin
-							uart_start_read <= 1;
-						end else begin
-							uart_start_read <= 0;
-						end
-					end
-					STATE_MEMLOADER_START: begin // Wait till busy goes away. Then assert a read start
-						if(!uart_rx_busy) begin
-							uart_start_read <= 1;
-							mem_loader_state <= STATE_MEMLOADER_LATCH;
-						end else
-							uart_start_read <= 0;
-					end
-					STATE_MEMLOADER_LATCH:
-						mem_loader_state <= STATE_MEMLOADER_WAIT;
-					STATE_MEMLOADER_WAIT: begin
-						uart_start_read <= 0;
-						if(uart_rd_avl) begin // New data is available
-							if(mem_loader_counter == 3) begin
-								sram_wr_ptr <= sram_wr_ptr + 1;
-								mem_loader_counter <= 0;
-							end
-							else
-								mem_loader_counter <= mem_loader_counter + 1;
-							mem_loader_state <= STATE_MEMLOADER_START; // Return back to idle state
-							if(sram_wr_ptr == 10'd1023) begin // If all 1024 bytes have been loaded, start running the core
-								state <= STATE_TRANSMIT_MEMORY_DEBUG;
-								mem_loader_state <= STATE_IDLE;
-							end
-						end else begin
-						end
-					end
-					default: begin
-							mem_loader_state <= STATE_IDLE;
-							state <= STATE_IDLE;
-					end
-				endcase
-			end
-			STATE_TRANSMIT_MEMORY_DEBUG: begin
-				dbg_sram <= sram0_data_out;
-				sram_rd_ptr <= sram_rd_ptr + 1;
-				if(sram_rd_ptr == 10'd1023) begin
-					state <= STATE_RUN_PROGRAM;
-					sram_rd_ptr <= 0;
-				end
-			end
-			STATE_RUN_PROGRAM: begin
-				core_reset <= 1; // Release reset on cores
-				if(core0_mem_valid) begin // Memory request has been placed, gets reset when mem_ready is set
-					core0_mem_ready <= 1;
-				end else begin
-					core0_mem_ready <= 0; // If no request has been placed, deassert mem_ready
-				end
-			end
-			default:
-				state <= STATE_IDLE;
-		endcase
+end
+
+
+
+
+reg [3:0] wv0_mem_sync_mem_instr;
+reg [3:0] wv0_mem_sync_mem_valid;
+wire [3:0] wv0_mem_sync_mem_ready;
+reg [127:0] wv0_mem_sync_mem_addr;
+reg [15:0] wv0_mem_sync_wstrb;
+wire [127:0] wv0_mem_sync_data_in;
+reg [127:0] wv0_mem_sync_data_out;
+
+wire [43:0] wv0_mem_sync_arbiter_addr;
+reg [127:0] wv0_mem_sync_arbiter_data_out;
+wire [127:0] wv0_mem_sync_arbiter_data_in;
+wire [3:0] wv0_mem_sync_arbiter_wr_en;
+wire [3:0] wv0_mem_sync_arbiter_rd_en;
+wire [15:0] wv0_mem_sync_arbiter_byte_en;
+wire [3:0] wv0_mem_sync_arbiter_request;
+reg [3:0] wv0_mem_sync_arbiter_grant;
+reg [3:0] wv0_mem_sync_arbiter_ready;
+
+
+mem_sync wv0_mem_sync
+(
+	.clk(clk), .nRST(nRST),
+	//WV
+	.mem_instr(wv0_mem_sync_mem_instr),
+	.mem_valid(wv0_mem_sync_mem_valid),
+	.mem_ready(wv0_mem_sync_mem_ready),
+	.mem_addr(wv0_mem_sync_mem_addr),
+	.wstrb(wv0_mem_sync_wstrb),
+	.data_in(wv0_mem_sync_data_in),
+	.data_out(wv0_mem_sync_data_out),
+	//MEM
+	.arbiter_addr(wv0_mem_sync_arbiter_addr),
+	.arbiter_data_out(wv0_mem_sync_arbiter_data_out),
+	.arbiter_data_in(wv0_mem_sync_arbiter_data_in),
+	.arbiter_wr_en(wv0_mem_sync_arbiter_wr_en),
+	.arbiter_rd_en(wv0_mem_sync_arbiter_rd_en),
+	.arbiter_byte_en(wv0_mem_sync_arbiter_byte_en),
+	.arbiter_request(wv0_mem_sync_arbiter_request),
+	.arbiter_grant(wv0_mem_sync_arbiter_grant),
+	.arbiter_ready(wv0_mem_sync_arbiter_ready)
+);
+
+
+reg [7:0] fb_wr_en;
+reg [7:0] fb_rd_en;
+reg [255:0] fb_byte_en;
+reg [255:0] fb_data_in;
+reg [87:0] fb_mem_addr;
+reg [7:0] fb_request;
+wire [7:0] fb_grant;
+wire [7:0] fb_ready;
+wire [31:0] fb_data_out;
+
+debug_fb fb 
+(
+	.clk(clk), .nRST(nRST),
+	.wr_en(fb_wr_en), .rd_en(fb_rd_en),
+	.addr(fb_mem_addr),
+	.data_out(fb_data_out), .data_in(fb_data_in),
+	.byte_en(fb_byte_en), .grant(fb_grant),
+	.request(fb_request), .ready(fb_ready)
+);// Mapped from
+
+wire [3:0] wave_mem_instr;
+wire [3:0] wave_mem_valid;
+reg [3:0] wave_mem_ready;
+wire [127:0] wave_mem_addr;
+wire [15:0] wave_wstrb;
+reg [127:0] wave_data_in;
+wire [127:0] wave_data_out;
+wavefront wv0
+(
+	.clk(clk), .nRST(nRST),
+	.mem_addr(wave_mem_addr),
+	.data_in(wave_data_in), .data_out(wave_data_out),
+	.wstrb(wave_wstrb), .mem_ready(wave_mem_ready),
+	.mem_valid(wave_mem_valid), .mem_instr(wave_mem_instr),
+	//FW intfc
+	.nFW_mode(nFW_mode), .fw_core_select(fw_core_select),
+	.fw_wave_select(fw_wave_select), .fw_mem_addr(fw_mem_addr),
+	.fw_data_in(fw_data_in), .fw_data_out(fw_data_out),
+	.fw_byte_en(fw_byte_en), .fw_rd_en(fw_rd_en),
+	.fw_wr_en(fw_wr_en)
+);
+
+reg [3:0] access_fb /* verilator lint_off UNOPTFLAT */;
+
+always @*begin
+	fb_byte_en = wv0_mem_sync_arbiter_byte_en;
+	fb_data_in = wv0_mem_sync_arbiter_data_in;
+	wv0_mem_sync_arbiter_data_out = fb_data_out;
+	wv0_mem_sync_arbiter_grant = fb_grant;
+	if(access_fb) begin
+		wave_data_in = wv0_mem_sync_data_in;
+		wv0_mem_sync_wstrb = wave_wstrb;
+		wv0_mem_sync_data_out = wave_data_out;
+		wv0_mem_sync_mem_valid = wave_mem_valid;
+		wv0_mem_sync_mem_instr = wave_mem_instr;
+		wave_mem_ready = wv0_mem_sync_mem_ready;
+	end else begin
+		wave_data_in = 0;
+		wv0_mem_sync_wstrb = 0;
+		wv0_mem_sync_data_out = 0;
+		wv0_mem_sync_mem_valid = 0;
+		wv0_mem_sync_mem_instr = 0;
+		wave_mem_ready = 0;
 	end
 end
+
+generate
+genvar i;
+for(i = 0; i < 4; i = i + 1) begin : blk_control_signals
+	always @* begin
+		access_fb[i] = (wave_mem_addr[(i + 1) * 32 - 1 -: 32] >= 32'h3000) && ( wave_mem_addr[(i + 1) * 32 - 1 -: 32] < 32'h5000);
+		fb_wr_en[i] = wv0_mem_sync_arbiter_wr_en[i] && access_fb[i];
+		fb_rd_en[i] = wv0_mem_sync_arbiter_rd_en[i] && access_fb[i];
+		fb_request[i] = wv0_mem_sync_arbiter_request[i] && access_fb[i];
+		wv0_mem_sync_arbiter_ready[i] = fb_ready[i];
+		fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = wv0_mem_sync_arbiter_addr[(i + 1) * 11 - 1 -: 11 ];
+		if(access_fb) begin
+			wv0_mem_sync_mem_addr[i * 32 +: 32] = (wave_mem_addr[i*32 +: 32] - 32'h3000);
+			wv0_mem_sync_mem_addr[i * 32 +: 32] = wv0_mem_sync_mem_addr[i * 32 + 2 +: 30] ;
+		end else begin
+			wv0_mem_sync_mem_addr[i * 32 +: 32] = 0;
+		end
+		if(!nFW_mode) begin
+			fb_wr_en[i] = 0;
+			fb_rd_en[i] = 0;
+			fb_request[i] = 0;
+			fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = 0;
+		end
+	end
+
+end
+endgenerate
+
 endmodule
+
+//module picorv_learn(input inclk, input nRST,
+//output reg[7:0] leds, output uart_tx_pin, input uart_rx_pin, output reg[7:0] dbg_sram);
+//wire clk;
+//pll_100 pll0(.inclk0(inclk), .c0(clk));
+//
+//reg uart_start_read;
+//wire uart_rd_avl;
+//wire uart_rx_busy;
+//wire [7:0] read_data;
+//
+//reg core_reset;
+//wire[31:0] core0_addr_bus;
+//wire[31:0] core0_wdata_bus;
+//reg[31:0] core0_rdata_bus;
+//wire[3:0] core0_wstrb; // Write strobe
+//localparam WSTRB_READ = 4'd0;
+//localparam WSTRB_BYTE0 = 4'd1;
+//localparam WSTRB_BYTE1 = 4'd2;
+//localparam WSTRB_BYTE2 = 4'd4;
+//localparam WSTRB_BYTE3 = 4'd8;
+//localparam WSTRB_LOWER_HWORD = 4'd3;
+//localparam WSTRB_HIGHER_HWORD = 4'd12;
+//localparam WSTRB_WORD = 4'd15;
+//wire core0_mem_valid; // core asserts 1 when a request is placed on the bus
+//reg core0_mem_ready; // peripheral asserts 1 when memory is ready to respond
+//
+//reg[7:0] state;
+//reg[7:0] mem_loader_state;
+//reg[2:0] mem_loader_counter;
+//localparam STATE_IDLE = 8'b0;
+//localparam STATE_LOAD_MEMORY = 8'd1;
+//localparam STATE_TRANSMIT_MEMORY_DEBUG = 8'd3;
+//localparam STATE_RUN_PROGRAM = 8'd2;
+//localparam STATE_MEMLOADER_START = 8'd1;
+//localparam STATE_MEMLOADER_LATCH = 8'd2;
+//localparam STATE_MEMLOADER_WAIT = 8'd3;
+//localparam STATE_MEMLOADER_WRITE = 8'd4;
+//
+//reg sram0_wr_en;
+//reg sram0_rd_en;
+//reg[9:0] sram0_addr_bus;
+//reg[31:0] sram0_data_in;
+//reg[3:0] sram0_data_be;
+//wire[31:0] sram0_data_out;
+//sram sram0(
+//	.clk(clk), .rd_en(sram0_rd_en), .wr_en(sram0_wr_en),
+//	.data_in(sram0_data_in), .data_out(sram0_data_out),
+//	.address(sram0_addr_bus), .byte_en(sram0_data_be)
+//); //1K*4B SRAM
+//reg[9:0] sram_rd_ptr;
+//reg[9:0] sram_wr_ptr;
+//
+//always @* begin
+//	if(state == STATE_LOAD_MEMORY) begin
+//		sram0_rd_en = 0;
+//		case(mem_loader_counter)
+//			0:
+//				sram0_data_be = 4'b1;
+//			1:
+//				sram0_data_be = 4'b10;
+//			2:
+//				sram0_data_be = 4'b100;
+//			3:
+//				sram0_data_be = 4'b1000;
+//			default: begin
+//				sram0_data_be = 4'b1111;
+//			end
+//		endcase
+//		sram0_addr_bus = sram_wr_ptr;
+//		sram0_data_in = {4{read_data}}; // Since we use a mask, replicate the read byte
+//		sram0_wr_en = uart_rd_avl & ~(uart_start_read); // Latch data in when output is valid
+//		core0_rdata_bus = 0;
+//	end
+//	else if (state == STATE_RUN_PROGRAM) begin
+//		sram0_rd_en = (core0_wstrb == WSTRB_READ) && core0_mem_valid;
+//		sram0_data_be = core0_wstrb;
+//		sram0_addr_bus = core0_addr_bus[11:2]; // Ignore the first two bits because SRAM has a 1024*4K struct
+//		sram0_data_in = core0_wdata_bus;
+//		sram0_wr_en = (core0_wstrb != 0) && core0_mem_valid;
+//		core0_rdata_bus = sram0_data_out;
+//	end
+//	else if (state == STATE_TRANSMIT_MEMORY_DEBUG) begin
+//		sram0_rd_en = 1;
+//		sram0_addr_bus = sram_rd_ptr;
+//		sram0_data_in = 0;
+//		sram0_data_be = 4'b1111;
+//		sram0_wr_en = 0;
+//		core0_rdata_bus = 0;
+//	end
+//	else begin
+//		sram0_addr_bus = 0;
+//		sram0_data_in = 0;
+//		sram0_data_be = 4'b1111;
+//		sram0_wr_en = 0;
+//		sram0_rd_en = 0;
+//		core0_rdata_bus = 0;
+//	end
+//end
+//
+//
+//
+//uart_rx urx(.clk(clk), .n_reset(nRST), .rx_pin(uart_rx_pin), .start_read(uart_start_read),
+//				.read_avl(uart_rd_avl), .read_data(read_data), .busy(uart_rx_busy));
+//
+//picorv32 core0(.clk(clk), .resetn(core_reset), .mem_valid(core0_mem_valid), .mem_ready(core0_mem_ready),
+//					.mem_addr(core0_addr_bus), .mem_rdata(core0_rdata_bus), .mem_wdata(core0_wdata_bus),
+//					.mem_wstrb(core0_wstrb));
+//
+//always @(posedge clk) begin
+//	if(!nRST)begin
+//		state <= STATE_IDLE;
+//		mem_loader_state <= STATE_IDLE;
+//		mem_loader_counter <= 0;
+//		core_reset <= 0; // Keep all cores reset till data is available;
+//		core0_mem_ready <= 0;
+//		sram_rd_ptr <= 0;
+//		sram_wr_ptr <= 0;
+//		uart_start_read <= 0;
+//		leds <= 0;
+//	end
+//	else begin
+//		case(state)
+//			STATE_IDLE: begin
+//				// Reset all necessary signals
+//				mem_loader_counter <= 0;
+//				uart_start_read <= 0;
+//				sram_rd_ptr <= 0;
+//				sram_wr_ptr <= 0;
+//				state <= STATE_LOAD_MEMORY;
+//				leds[0] <= 1;
+//			end
+//			STATE_LOAD_MEMORY: begin
+//				case(mem_loader_state)
+//					STATE_IDLE: begin // Wait till data is given
+//						if(uart_rd_avl) begin
+//							uart_start_read <= 0;
+//							if(read_data == "S") begin
+//								mem_loader_state <= STATE_MEMLOADER_START;
+//							end else begin
+//								mem_loader_state <= STATE_IDLE;
+//							end
+//						end else if(!uart_rx_busy) begin
+//							uart_start_read <= 1;
+//						end else begin
+//							uart_start_read <= 0;
+//						end
+//					end
+//					STATE_MEMLOADER_START: begin // Wait till busy goes away. Then assert a read start
+//						if(!uart_rx_busy) begin
+//							uart_start_read <= 1;
+//							mem_loader_state <= STATE_MEMLOADER_LATCH;
+//						end else
+//							uart_start_read <= 0;
+//					end
+//					STATE_MEMLOADER_LATCH:
+//						mem_loader_state <= STATE_MEMLOADER_WAIT;
+//					STATE_MEMLOADER_WAIT: begin
+//						uart_start_read <= 0;
+//						if(uart_rd_avl) begin // New data is available
+//							if(mem_loader_counter == 3) begin
+//								sram_wr_ptr <= sram_wr_ptr + 1;
+//								mem_loader_counter <= 0;
+//							end
+//							else
+//								mem_loader_counter <= mem_loader_counter + 1;
+//							mem_loader_state <= STATE_MEMLOADER_START; // Return back to idle state
+//							if(sram_wr_ptr == 10'd1023) begin // If all 1024 bytes have been loaded, start running the core
+//								state <= STATE_TRANSMIT_MEMORY_DEBUG;
+//								mem_loader_state <= STATE_IDLE;
+//							end
+//						end else begin
+//						end
+//					end
+//					default: begin
+//							mem_loader_state <= STATE_IDLE;
+//							state <= STATE_IDLE;
+//					end
+//				endcase
+//			end
+//			STATE_TRANSMIT_MEMORY_DEBUG: begin
+//				dbg_sram <= sram0_data_out;
+//				sram_rd_ptr <= sram_rd_ptr + 1;
+//				if(sram_rd_ptr == 10'd1023) begin
+//					state <= STATE_RUN_PROGRAM;
+//					sram_rd_ptr <= 0;
+//				end
+//			end
+//			STATE_RUN_PROGRAM: begin
+//				core_reset <= 1; // Release reset on cores
+//				if(core0_mem_valid) begin // Memory request has been placed, gets reset when mem_ready is set
+//					core0_mem_ready <= 1;
+//				end else begin
+//					core0_mem_ready <= 0; // If no request has been placed, deassert mem_ready
+//				end
+//			end
+//			default:
+//				state <= STATE_IDLE;
+//		endcase
+//	end
+//end
+//endmodule
