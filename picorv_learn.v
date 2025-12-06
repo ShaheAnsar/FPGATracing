@@ -12,7 +12,12 @@ module newton_raphson_divider #
 );
 	reg[31:0] i_divider;
 	reg[31:0] i_dividend;
-	reg[63:0] i_quotient;
+	wire[31:0] i_divider_abs;
+	wire[31:0] i_dividend_abs;
+	reg[62:0] i_quotient;
+	assign i_dividend_abs = (i_dividend_abs & (1 << 31))?(~i_dividend + 1):(i_dividend);
+	assign i_divider_abs = (i_divider_abs & (1 << 31))?(~i_divider + 1):(i_divider);
+	reg negative;
 	reg[4:0] shift_count;
 	reg[4:0] iter_count;
 	reg[1:0] shift_dir;
@@ -87,7 +92,7 @@ module newton_raphson_divider #
 				end
 				STATE_NEWTON_ITER: begin
 					if(iter_count < ITERATIONS) begin
-						i_quotient <= ( i_quotient * (2 - ( ( i_quotient * i_divider ) >> 16)) >> 16);
+						i_quotient <=  (i_quotient * (TWO - ( ( i_quotient * i_divider ) >> 16))) >> 16;
 						iter_count <= iter_count + 1;
 					end else begin
 						state <= STATE_CALCULATE_QUOTIENT;
@@ -95,7 +100,8 @@ module newton_raphson_divider #
 				end
 				STATE_CALCULATE_QUOTIENT: begin
 					ready <= 1;
-					quotient <= (shift_dir == LEFT_SHIFT)?( (i_quotient * i_divider) << shift_count ) : ((i_quotient * i_divider) >> shift_count);
+					//quotient <= ( (shift_dir == LEFT_SHIFT)?( (i_quotient * i_divider) << shift_count ) : ((i_quotient * i_divider) >> shift_count) ) >> 16;
+					quotient <= (shift_dir == LEFT_SHIFT)?(((i_quotient * i_dividend) >> 16) << shift_count):(((i_quotient * i_dividend) >> 16) >> shift_count);
 					state <= STATE_IDLE;
 				end
 				default:
@@ -104,6 +110,16 @@ module newton_raphson_divider #
 		end
 	end
 endmodule
+
+
+module RayBoxIntersection
+(
+	input clk,
+	input nRST,
+	input [95:0] ray_origin, // Packed as [z, y, x]
+	input [95:0] ray_direction,
+	input [95:0] ray_
+);
 
 
 
