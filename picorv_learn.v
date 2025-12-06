@@ -1,3 +1,81 @@
+module newton_raphson_divider #
+(
+	parameter FRACTIONAL_BITS=16,
+	parameter ITERATIONS=4
+)
+(
+	input clk, input nRST,
+	input request,
+	input [31:0] divider, input [31:0] dividend, /* Numbers are in 1.15.16 fixed point */
+	output reg [31:0] quotient,
+	output reg ready
+);
+	reg[31:0] i_divider;
+	reg[31:0] i_dividend;
+	reg[63:0] i_quotient;
+	reg[4:0] shift_count;
+	reg[4:0] iter_count;
+	reg[1:0] shift_dir;
+
+	reg fault;
+
+	localparam INITIAL_GUESS = 32'h1c000; // 1.75
+	localparam ONE = 32'd1 << FRACTIONAL_BITS;
+	localparam ONE_HALF = 32'd1 << (FRACTIONAL_BITS - 1);
+	
+	localparam LEFT_SHIFT = 2'd0;
+	localparam RIGHT_SHIFT = 2'd1;
+	
+	localparam STATE_IDLE = 4'd0;
+	localparam STATE_SHIFT_IN_RANGE = 4'd1; // The divider needs to be bit shifted till it is between 0.5 and 1
+	localparam STATE_NEWTON_ITER = 4'd2; // Execute iteration of Newton Raphson
+	localparam STATE_CALCULATE_QUOTIENT = 4'd3; // Calculate the quotient
+	reg[3:0] state;
+	
+	always @(posedge clk) begin
+		if(!nRST) begin
+			fault <= 0;
+			i_dividend <= 0;
+			i_divider <= 0;
+			i_quotient <= 0;
+			shift_count <= 0;
+			shift_dir <= 0;
+			state <= STATE_IDLE;
+		end else begin
+			case(state)
+				STATE_IDLE: begin
+					i_divider <= divider;
+					i_dividend <= dividend;
+					if(request) begin
+						state <= STATE_SHIFT_IN_RANGE;
+					end
+				end
+				STATE_SHIFT_IN_RANGE: begin
+					if(i_divider > ONE) begin
+						shift_dir <= RIGHT_SHIFT;
+						i_divider = i_divider >> 1;
+						shift_count <= shift_count + 1;
+					end else if (i_divider < ONE_HALF) begin
+						shift_dir <= LEFT_SHIFT;
+						i_divider = i_divider << 1;
+						shift_count <= shift_count + 1;
+					end else begin
+						i_quotient <= INITIAL_GUESS;
+						state <= STATE_NEWTON_ITER;
+					end
+				end
+				STATE_NEWTON_ITER: begin
+					i_quotient <= i_quotient * (2 - i_quotient * i_divider);
+				end
+				default:
+					fault <= 1;
+			endcase
+		end
+	end
+endmodule
+
+
+
 module core_unit
 (
 	input clk,
@@ -932,6 +1010,7 @@ reg [15:0] write_counter;
 reg [31:0] word;
 reg [2:0] word_counter;
 reg [63:0] cycle_counter;
+reg fsm_send_fb_req;
 
 localparam STATE_START_SYNC_READ = 4'd0;
 localparam STATE_START_READ = 4'd1; // Read from UART
@@ -944,6 +1023,7 @@ localparam STATE_CHECK_SYNC_READ = 4'hf;
 localparam STATE_RUN_PROGRAM = 4'd8;
 localparam STATE_HANG = 4'd9;
 localparam STATE_READ_DELAY = 4'd10;
+localparam STATE_WRITE_DELAY = 4'd11;
 reg [3:0] state;
 always @* begin
 	//leds[6] = !urx_busy;
@@ -968,6 +1048,7 @@ end
 always @(posedge clk) begin
 	if(!nRST) begin
 		state <= STATE_START_SYNC_READ;
+		fsm_send_fb_req <= 0;
 		read_counter <= 0;
 		word <= 0;
 		word_counter <= 0;
@@ -1068,12 +1149,14 @@ always @(posedge clk) begin
 				cycle_counter <= 0;
 				write_counter <= 0;
 				word_counter <= 0;
+				fsm_send_fb_req <= 1;
 				state <= STATE_LOAD_WORD;
 			end else begin
 				cycle_counter <= cycle_counter + 1;
 			end
 		end
 		STATE_LOAD_WORD: begin
+			fsm_send_fb_req <= 0;
 			if(write_counter >= 2048) begin // All data has been sent out
 				state <= STATE_HANG;
 			end else if(fb_ready) begin // Data is ready now
@@ -1090,12 +1173,17 @@ always @(posedge clk) begin
 			utx_start_write <= 0;
 			if(word_counter >= 4) begin
 				word_counter <= 0;
+				fsm_send_fb_req <= 1;
 				state <= STATE_LOAD_WORD;
 			end else if(utx_write_avl) begin
 				utx_write_data <= word[word_counter*8 +: 8];
 				utx_start_write <= 1;
 				word_counter <= word_counter + 1;
-			end	 
+				state <= STATE_WRITE_DELAY;
+			end
+		end
+		STATE_WRITE_DELAY: begin
+			state <= STATE_START_WRITE;
 		end
 		default: begin
 		end
@@ -1269,9 +1357,9 @@ for(i = 0; i < 4; i = i + 1) begin : blk_control_signals
 				fb_request[i] = 0;
 				fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = 0;
 			end
-		end else if (state == STATE_LOAD_WORD) begin /* Connect FB to FSM */
+		end else if (state == STATE_LOAD_WORD || STATE_START_WRITE || STATE_WRITE_DELAY) begin /* Connect FB to FSM */
 			fb_rd_en[i] = 1;
-			fb_request[i] = 1;
+			fb_request[i] = fsm_send_fb_req;
 			fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = write_counter;
 		end
 	end
