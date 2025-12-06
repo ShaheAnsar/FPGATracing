@@ -277,6 +277,10 @@ always @* begin /* Comb */
 	cores[1].data_in = 0;
 	cores[2].data_in = 0;
 	cores[3].data_in = 0;
+	cores[0].mem_ready = 0;
+	cores[1].mem_ready = 0;
+	cores[2].mem_ready = 0;
+	cores[3].mem_ready = 0;
 	// Disable core fw interface
 	// Manually unrolling loop at the moment because Verilator doesn't
 	// support for loops well
@@ -797,6 +801,8 @@ debug_fb fb
 	.data_out(fb_data_out), .data_in(fb_data_in),
 	.byte_en(fb_byte_en), .grant(fb_grant),
 	.request(fb_request), .ready(fb_ready)
+	// FW mode stuff
+	
 );// Mapped from
 
 wire [3:0] wave_mem_instr;
@@ -897,31 +903,18 @@ module picorv_learn
 	input uart_rx_pin
 );
 
-	.nFW_mode(nFW_mode), .fw_core_select(fw_core_select),
-	.fw_wave_select(fw_wave_select), .fw_mem_addr(fw_mem_addr),
-	.fw_data_in(fw_data_in), .fw_data_out(fw_data_out),
-	.fw_byte_en(fw_byte_en), .fw_rd_en(fw_rd_en),
-	.fw_wr_en(fw_wr_en)
 
-reg nFW_mode;
-reg [3:0] fw_core_select;
-reg [31:0] fw_mem_addr;
-reg [31:0] fw_data_out;
-reg fw_rd_en;
-reg fw_wr_en;
-reg [3:0] fw_byte_en;
-reg [31:0] fw_data_in;
-reg fw_wave_select;
-
-
+wire clk;
+pll_100 pll0(.inclk0(inclk), .c0(clk));
+//assign clk = inclk;
 reg urx_start_read;
 wire urx_read_avl;
-wire urx_read_data;
+wire[7:0] urx_read_data;
 wire urx_busy;
 uart_rx urx(
 	.clk(clk), .n_reset(nRST),
 	.rx_pin(uart_rx_pin), .start_read(urx_start_read),
-	.read_avl(urx_rd_avl), .read_data(urx_read_data),
+	.read_avl(urx_read_avl), .read_data(urx_read_data),
 	.busy(urx_busy)
 );
 
@@ -938,6 +931,7 @@ reg [15:0] read_counter;
 reg [15:0] write_counter;
 reg [31:0] word;
 reg [2:0] word_counter;
+reg [63:0] cycle_counter;
 
 localparam STATE_START_SYNC_READ = 4'd0;
 localparam STATE_START_READ = 4'd1; // Read from UART
@@ -946,23 +940,59 @@ localparam STATE_STORE_WORD = 4'd3;
 localparam STATE_START_WRITE = 4'd4; // Write to UART
 localparam STATE_LOAD_WORD = 4'd5;
 localparam STATE_WRITE_BYTE = 4'd6;
-localparam STATE_CHECK_SYNC_READ = 4'd7;
+localparam STATE_CHECK_SYNC_READ = 4'hf;
 localparam STATE_RUN_PROGRAM = 4'd8;
+localparam STATE_HANG = 4'd9;
+localparam STATE_READ_DELAY = 4'd10;
 reg [3:0] state;
+always @* begin
+	//leds[6] = !urx_busy;
+	//leds[5] = urx_read_avl;
+	//leds[4] = urx_start_read;
+	leds[3:0] = state;
+//	leds = read_counter[15:8];
+end
+/* Heartbeat */
+//reg [25:0] heartbeat_red;
+//always @(posedge clk) begin
+//	heartbeat_red <= heartbeat_red + 1;
+//	if(heartbeat_red[25])
+//		leds[7] <= ~leds[7];
+//	if(!nRST) begin
+//		leds[7] <= 0;
+//		heartbeat_red <= 0;
+//	end
+//end
 
 /* Load FW */
 always @(posedge clk) begin
+	if(!nRST) begin
+		state <= STATE_START_SYNC_READ;
+		read_counter <= 0;
+		word <= 0;
+		word_counter <= 0;
+		write_counter <= 0;
+		cycle_counter <= 0;
+		nFW_mode <= 0;
+		fw_core_select <= 0;
+		fw_mem_addr <= 0;
+		fw_rd_en <= 0;
+		fw_wr_en <= 0;
+		fw_byte_en <= 0;
+		fw_data_in <= 0;
+		fw_wave_select <= 0;
+	end else begin
 	case(state)
 		STATE_START_SYNC_READ: begin
-			if(urx_read_avl) begin
-				urx_read_start <= 1;
+			if(!urx_busy) begin
+				urx_start_read <= 1;
 				state <= STATE_CHECK_SYNC_READ;
 			end
 		end
 		STATE_CHECK_SYNC_READ: begin
-			urx_read_start <= 0;
-			if(urx_busy == 0) begin /* Read has completed */
-				if(urx_read_data == "S") begin /* Sync byte received */
+			urx_start_read <= 0;
+			if(urx_read_avl) begin /* Read has completed */
+				if(urx_read_data == 8'h53) begin /* Sync byte received */
 					state <= STATE_START_READ; /* Start loading fw */
 				end else begin
 					state <= STATE_START_SYNC_READ; /* Read again */
@@ -970,52 +1000,107 @@ always @(posedge clk) begin
 			end
 		end
 		STATE_START_READ: begin
-			if(urx_read_avl) begin
-				urx_read_start <= 1;
-				state <= STATE_READ_BYTE;
+			fw_wr_en <= 0;
+			if(!urx_busy) begin
+				urx_start_read <= 1;
+				state <= STATE_READ_DELAY;
 			end
 		end
+		STATE_READ_DELAY: begin
+			state <= STATE_READ_BYTE;
+		end
 		STATE_READ_BYTE: begin
-			fw_wr_en <= 0;
-			urx_read_start <= 0;
-			if(!urx_busy) begin
-				if(word_counter < 4) begin
-					word <= {urx_read_data, word[23:0]};
+			nFW_mode <= 0;
+			urx_start_read <= 0;
+			if(urx_read_avl) begin
+				word <= {urx_read_data, word[31:8]};
+				if(word_counter < 3) begin
 					word_counter <= word_counter + 1;
-				end
-				else begin
-					state <= STATE_STORE_WORD;
+					state <= STATE_START_READ;
+				end else begin
 					word_counter <= 0;
+					state <= STATE_STORE_WORD;
 				end
 			end
 		end
 		STATE_STORE_WORD: begin
 			if(read_counter < 16'h1400) begin
-				fw_mem_addr <= read_counter;
+				if(read_counter < 1024) begin /* Instructions */
+					fw_wave_select <= 1;
+					fw_core_select <= 0;
+					fw_mem_addr <= read_counter;
+				end else if (read_counter < 2048) begin /* Private data Core 0 */
+					fw_wave_select <= 0;
+					fw_core_select <= 0;
+					fw_mem_addr <= read_counter - 1024;
+				end else if (read_counter < 3072) begin /* Private data Core 1 */
+					fw_wave_select <= 0;
+					fw_core_select <= 1;
+					fw_mem_addr <= read_counter - 2048;
+				end else if (read_counter < 4096) begin /* Private data Core 2 */
+					fw_wave_select <= 0;
+					fw_core_select <= 2;
+					fw_mem_addr <= read_counter - 3072;
+				end else begin /* Private data Core 3 */
+					fw_wave_select <= 0;
+					fw_core_select <= 3;
+					fw_mem_addr <= read_counter - 4096;
+				end
+				//fw_mem_addr <= read_counter;
 				fw_data_in <= word;
 				fw_byte_en <= 4'b1111;
 				fw_wr_en <= 1;
 				read_counter <= read_counter + 1;
-				state <= STATE_START_READ;
+				
+				if(read_counter < 16'h13ff)
+					state <= STATE_START_READ;
 			end else begin
+				fw_wr_en <= 0;
 				read_counter <= 0;
+				cycle_counter <= 0;
 				state <= STATE_RUN_PROGRAM;
 			end
 		end
 		STATE_RUN_PROGRAM: begin
+			nFW_mode <= 1;
+//			if(cycle_counter == 64'h3b9aca00) begin
+			if(cycle_counter == 64'd50000000) begin
+				cycle_counter <= 0;
+				write_counter <= 0;
+				word_counter <= 0;
+				state <= STATE_LOAD_WORD;
+			end else begin
+				cycle_counter <= cycle_counter + 1;
+			end
+		end
+		STATE_LOAD_WORD: begin
+			if(write_counter >= 2048) begin // All data has been sent out
+				state <= STATE_HANG;
+			end else if(fb_ready) begin // Data is ready now
+				word <= fb_data_out;
+				write_counter <= write_counter + 1;
+				state <= STATE_START_WRITE;
+			end
+		end
+
+		STATE_HANG: begin
+			state <= STATE_HANG;
+		end
+		STATE_START_WRITE: begin
+			utx_start_write <= 0;
+			if(word_counter >= 4) begin
+				word_counter <= 0;
+				state <= STATE_LOAD_WORD;
+			end else if(utx_write_avl) begin
+				utx_write_data <= word[word_counter*8 +: 8];
+				utx_start_write <= 1;
+				word_counter <= word_counter + 1;
+			end	 
 		end
 		default: begin
-			leds[0] <= 1; // Show fault
 		end
 	endcase
-	if(nRST) begin
-		state <= STATE_IDLE;
-		read_counter <= 0;
-		word <= 0;
-		word_counter <= 0;
-		write_counter <= 0;
-		leds <= 0;
-	end
+end
 end
 
 
@@ -1084,6 +1169,15 @@ debug_fb fb
 	.request(fb_request), .ready(fb_ready)
 );// Mapped from
 
+reg nFW_mode;
+reg [3:0] fw_core_select;
+reg [31:0] fw_mem_addr;
+wire [31:0] fw_data_out;
+reg fw_rd_en;
+reg fw_wr_en;
+reg [3:0] fw_byte_en;
+reg [31:0] fw_data_in;
+reg fw_wave_select;
 wire [3:0] wave_mem_instr;
 wire [3:0] wave_mem_valid;
 reg [3:0] wave_mem_ready;
@@ -1109,24 +1203,39 @@ wavefront wv0
 reg [3:0] access_fb /* verilator lint_off UNOPTFLAT */;
 
 always @*begin
-	fb_byte_en = wv0_mem_sync_arbiter_byte_en;
-	fb_data_in = wv0_mem_sync_arbiter_data_in;
-	wv0_mem_sync_arbiter_data_out = fb_data_out;
-	wv0_mem_sync_arbiter_grant = fb_grant;
-	if(access_fb) begin
-		wave_data_in = wv0_mem_sync_data_in;
-		wv0_mem_sync_wstrb = wave_wstrb;
-		wv0_mem_sync_data_out = wave_data_out;
-		wv0_mem_sync_mem_valid = wave_mem_valid;
-		wv0_mem_sync_mem_instr = wave_mem_instr;
-		wave_mem_ready = wv0_mem_sync_mem_ready;
-	end else begin
-		wave_data_in = 0;
-		wv0_mem_sync_wstrb = 0;
-		wv0_mem_sync_data_out = 0;
-		wv0_mem_sync_mem_valid = 0;
-		wv0_mem_sync_mem_instr = 0;
-		wave_mem_ready = 0;
+	fb_byte_en = 0;
+	fb_data_in = 0;
+	wv0_mem_sync_arbiter_data_out =0;
+	wv0_mem_sync_arbiter_grant =0;
+	wave_data_in = 0;
+	wv0_mem_sync_wstrb = 0;
+	wv0_mem_sync_data_out = 0;
+	wv0_mem_sync_mem_valid = 0;
+	wv0_mem_sync_mem_instr = 0;
+	wave_mem_ready = 0;
+	if(state == STATE_RUN_PROGRAM) begin
+		fb_byte_en = wv0_mem_sync_arbiter_byte_en;
+		fb_data_in = wv0_mem_sync_arbiter_data_in;
+		wv0_mem_sync_arbiter_data_out = fb_data_out;
+		wv0_mem_sync_arbiter_grant = fb_grant;
+		if(access_fb) begin
+			wave_data_in = wv0_mem_sync_data_in;
+			wv0_mem_sync_wstrb = wave_wstrb;
+			wv0_mem_sync_data_out = wave_data_out;
+			wv0_mem_sync_mem_valid = wave_mem_valid;
+			wv0_mem_sync_mem_instr = wave_mem_instr;
+			wave_mem_ready = wv0_mem_sync_mem_ready;
+		end else begin
+			wave_data_in = 0;
+			wv0_mem_sync_wstrb = 0;
+			wv0_mem_sync_data_out = 0;
+			wv0_mem_sync_mem_valid = 0;
+			wv0_mem_sync_mem_instr = 0;
+			wave_mem_ready = 0;
+		end
+	end else if (state == STATE_LOAD_WORD) begin /* Connect FB to FSM */
+		fb_byte_en = 0;
+		fb_data_in = 0;
 	end
 end
 
@@ -1135,22 +1244,35 @@ genvar i;
 for(i = 0; i < 4; i = i + 1) begin : blk_control_signals
 	always @* begin
 		access_fb[i] = (wave_mem_addr[(i + 1) * 32 - 1 -: 32] >= 32'h3000) && ( wave_mem_addr[(i + 1) * 32 - 1 -: 32] < 32'h5000);
-		fb_wr_en[i] = wv0_mem_sync_arbiter_wr_en[i] && access_fb[i];
-		fb_rd_en[i] = wv0_mem_sync_arbiter_rd_en[i] && access_fb[i];
-		fb_request[i] = wv0_mem_sync_arbiter_request[i] && access_fb[i];
-		wv0_mem_sync_arbiter_ready[i] = fb_ready[i];
-		fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = wv0_mem_sync_arbiter_addr[(i + 1) * 11 - 1 -: 11 ];
-		if(access_fb) begin
-			wv0_mem_sync_mem_addr[i * 32 +: 32] = (wave_mem_addr[i*32 +: 32] - 32'h3000);
-			wv0_mem_sync_mem_addr[i * 32 +: 32] = wv0_mem_sync_mem_addr[i * 32 + 2 +: 30] ;
-		end else begin
-			wv0_mem_sync_mem_addr[i * 32 +: 32] = 0;
-		end
-		if(!nFW_mode) begin
-			fb_wr_en[i] = 0;
-			fb_rd_en[i] = 0;
-			fb_request[i] = 0;
-			fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = 0;
+		fb_wr_en[i] = 0;
+		fb_rd_en[i] = 0;
+		fb_request[i] = 0;
+		wv0_mem_sync_arbiter_ready[i] = 0;
+		fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = 0;
+		wv0_mem_sync_mem_addr[i * 32 +: 32] = 0;
+
+		if(state == STATE_RUN_PROGRAM) begin
+			fb_wr_en[i] = wv0_mem_sync_arbiter_wr_en[i] && access_fb[i];
+			fb_rd_en[i] = wv0_mem_sync_arbiter_rd_en[i] && access_fb[i];
+			fb_request[i] = wv0_mem_sync_arbiter_request[i] && access_fb[i];
+			wv0_mem_sync_arbiter_ready[i] = fb_ready[i];
+			fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = wv0_mem_sync_arbiter_addr[(i + 1) * 11 - 1 -: 11 ];
+			if(access_fb) begin
+				wv0_mem_sync_mem_addr[i * 32 +: 32] = (wave_mem_addr[i*32 +: 32] - 32'h3000);
+				wv0_mem_sync_mem_addr[i * 32 +: 32] = wv0_mem_sync_mem_addr[i * 32 + 2 +: 30] ;
+			end else begin
+				wv0_mem_sync_mem_addr[i * 32 +: 32] = 0;
+			end
+			if(!nFW_mode) begin
+				fb_wr_en[i] = 0;
+				fb_rd_en[i] = 0;
+				fb_request[i] = 0;
+				fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = 0;
+			end
+		end else if (state == STATE_LOAD_WORD) begin /* Connect FB to FSM */
+			fb_rd_en[i] = 1;
+			fb_request[i] = 1;
+			fb_mem_addr[(i + 1) * 11 - 1 -: 11 ] = write_counter;
 		end
 	end
 

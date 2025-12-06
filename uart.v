@@ -1,4 +1,4 @@
-module uart_tx#(parameter CLOCK=100000000, parameter BAUDRATE=115200)(output tx_pin,
+module uart_tx#(parameter CLOCK=50000000, parameter BAUDRATE=115200)(output tx_pin,
 						input clk, input[32:0] baud_ctr_top, input n_reset,
 						input start_write, output reg write_avl, input [7:0] write_data);
 localparam baudgen_top_val = CLOCK/BAUDRATE;
@@ -63,7 +63,7 @@ always @(posedge clk) begin
 end					
 endmodule
 
-module uart_rx#(parameter CLOCK=100000000, parameter BAUDRATE=115200)
+module uart_rx#(parameter CLOCK=50000000, parameter BAUDRATE=115200)
 (input rx_pin, input clk, input start_read, output reg read_avl, output reg busy, input n_reset, output reg[7:0] read_data, output[1:0] dbg_leds);
 localparam baudgen_top = CLOCK/BAUDRATE - 1;
 localparam oversample_top = CLOCK/BAUDRATE/8 - 1;
