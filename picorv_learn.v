@@ -21,7 +21,11 @@ module newton_raphson_divider #
 
 	localparam INITIAL_GUESS = 32'h1c000; // 1.75
 	localparam ONE = 32'd1 << FRACTIONAL_BITS;
+	localparam TWO = (ONE) << 1;
+	localparam FOUR = (ONE) << 2;
 	localparam ONE_HALF = 32'd1 << (FRACTIONAL_BITS - 1);
+	localparam ONE_FOURTH = (ONE_HALF) >> 1;
+	localparam ONE_EIGHTH = (ONE_HALF) >> 2;
 	
 	localparam LEFT_SHIFT = 2'd0;
 	localparam RIGHT_SHIFT = 2'd1;
@@ -47,14 +51,31 @@ module newton_raphson_divider #
 					i_divider <= divider;
 					i_dividend <= dividend;
 					if(request) begin
+						ready <= 0;
 						state <= STATE_SHIFT_IN_RANGE;
 					end
 				end
 				STATE_SHIFT_IN_RANGE: begin
-					if(i_divider > ONE) begin
+					if(i_divider > FOUR) begin
+						shift_dir <= RIGHT_SHIFT;
+						i_divider = i_divider >> 3;
+						shift_count <= shift_count + 3;
+					end else if(i_divider > TWO) begin
+						shift_dir <= RIGHT_SHIFT;
+						i_divider = i_divider >> 2;
+						shift_count <= shift_count + 2;
+					end else if(i_divider > ONE) begin
 						shift_dir <= RIGHT_SHIFT;
 						i_divider = i_divider >> 1;
 						shift_count <= shift_count + 1;
+					end else if (i_divider < ONE_EIGHTH) begin
+						shift_dir <= LEFT_SHIFT;
+						i_divider = i_divider << 3;
+						shift_count <= shift_count + 3;
+					end else if (i_divider < ONE_FOURTH) begin
+						shift_dir <= LEFT_SHIFT;
+						i_divider = i_divider << 2;
+						shift_count <= shift_count + 2;
 					end else if (i_divider < ONE_HALF) begin
 						shift_dir <= LEFT_SHIFT;
 						i_divider = i_divider << 1;
@@ -65,7 +86,17 @@ module newton_raphson_divider #
 					end
 				end
 				STATE_NEWTON_ITER: begin
-					i_quotient <= i_quotient * (2 - i_quotient * i_divider);
+					if(iter_count < ITERATIONS) begin
+						i_quotient <= ( i_quotient * (2 - ( ( i_quotient * i_divider ) >> 16)) >> 16);
+						iter_count <= iter_count + 1;
+					end else begin
+						state <= STATE_CALCULATE_QUOTIENT;
+					end
+				end
+				STATE_CALCULATE_QUOTIENT: begin
+					ready <= 1;
+					quotient <= (shift_dir == LEFT_SHIFT)?( (i_quotient * i_divider) << shift_count ) : ((i_quotient * i_divider) >> shift_count);
+					state <= STATE_IDLE;
 				end
 				default:
 					fault <= 1;
@@ -73,6 +104,9 @@ module newton_raphson_divider #
 		end
 	end
 endmodule
+
+
+
 
 
 
